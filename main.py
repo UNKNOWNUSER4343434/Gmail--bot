@@ -16,7 +16,6 @@ from aiogram.types import (
 from flask import Flask
 
 # ======================= FLASK DUMMY SERVER =======================
-# Yeh server Render ko khush rakhega taaki service crash na ho
 web_app = Flask(__name__)
 
 
@@ -689,4 +688,101 @@ async def process_bulk_stock(message: types.Message, state: FSMContext):
     return
   lines = message.text.strip().split("\n")
   added = 0
-  for line in l
+  for line in lines:
+    if ":" in line:
+      parts = line.split(":", 1)
+      mail = parts[0].strip()
+      pwd = parts[1].strip()
+      try:
+        cursor.execute(
+            "INSERT INTO task_stock (email, password) VALUES (?, ?)",
+            (mail, pwd),
+        )
+        added += 1
+      except sqlite3.IntegrityError:
+        pass
+  conn.commit()
+
+  await message.answer(
+      f"✅ **Import Successful!**\nAdded **{added}** accounts to task stock.\n"
+      f"Total Available Stock: **{get_available_stock_count()}**"
+  )
+  await state.clear()
+
+
+# --- Update Rate ---
+@dp.callback_query(F.data == "adm_change_rate")
+async def adm_rate_change(call: types.CallbackQuery, state: FSMContext):
+  if call.from_user.id != ADMIN_ID:
+    return
+  await call.message.answer("Enter new payout rate per Gmail (e.g., 15 or 20):")
+  await state.set_state(AdminState.waiting_for_new_rate)
+  await call.answer()
+
+
+@dp.message(AdminState.waiting_for_new_rate)
+async def process_new_rate(message: types.Message, state: FSMContext):
+  if message.from_user.id != ADMIN_ID:
+    return
+  try:
+    new_val = float(message.text.strip())
+    set_rate(new_val)
+    await message.answer(
+        f"✅ Rate successfully updated to: **₹{new_val:.2f}** per account.",
+        parse_mode="Markdown",
+    )
+  except ValueError:
+    await message.answer("⚠️ Please enter a valid numeric value.")
+  await state.clear()
+
+
+# --- Add Balance Manually ---
+@dp.callback_query(F.data == "adm_add_bal")
+async def adm_add_balance(call: types.CallbackQuery, state: FSMContext):
+  if call.from_user.id != ADMIN_ID:
+    return
+  await call.message.answer("Enter the numeric **Telegram User ID**:")
+  await state.set_state(AdminState.waiting_for_addbal_id)
+  await call.answer()
+
+
+@dp.message(AdminState.waiting_for_addbal_id)
+async def process_bal_uid(message: types.Message, state: FSMContext):
+  await state.update_data(target_uid=message.text.strip())
+  await message.answer(
+      "Enter amount to add/deduct (e.g., `50` to add, `-15` to deduct):"
+  )
+  await state.set_state(AdminState.waiting_for_addbal_amount)
+
+
+@dp.message(AdminState.waiting_for_addbal_amount)
+async def process_bal_amt(message: types.Message, state: FSMContext):
+  data = await state.get_data()
+  uid = int(data["target_uid"])
+  amt = float(message.text.strip())
+
+  cursor.execute(
+      "UPDATE users SET balance = balance + ? WHERE user_id=?", (amt, uid)
+  )
+  conn.commit()
+
+  await message.answer(
+      f"✅ Updated balance for User ID `{uid}` by ₹{amt:.2f}.",
+      parse_mode="Markdown",
+  )
+  await state.clear()
+
+
+# ======================= MAIN ENTRY =======================
+async def main():
+  flask_thread = threading.Thread(target=run_flask, daemon=True)
+  flask_thread.start()
+
+  print("=" * 45)
+  print("🔥 GMAIL SELLER BOT IS RUNNING ON RENDER 🔥")
+  print("=" * 45)
+  await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+  asyncio.run(main())
