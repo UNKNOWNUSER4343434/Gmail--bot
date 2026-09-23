@@ -237,12 +237,12 @@ def kb_2fa():
 class SubmitState(StatesGroup):
     choosing_mode = State()
     waiting_for_task_action = State()  # Done / Cancel for bot task
-    waiting_for_email = State()        # For readymade flow
-    waiting_for_password = State()     # For readymade flow
-    waiting_for_recovery = State()
-    waiting_for_age = State()
-    waiting_for_2fa_choice = State()
-    waiting_for_2fa_key = State()
+    waiting_for_email = State()        # For readymade
+    waiting_for_password = State()     # For readymade
+    waiting_for_recovery = State()     # For readymade
+    waiting_for_age = State()          # For readymade
+    waiting_for_2fa_choice = State()   # For readymade
+    waiting_for_2fa_key = State()      # For readymade
 
 class WithdrawState(StatesGroup):
     waiting_for_upi = State()
@@ -262,7 +262,6 @@ async def cancel_handler(message: types.Message, state: FSMContext):
     data = await state.get_data()
     assigned_stock_id = data.get("assigned_stock_id")
     
-    # If user cancels a reserved bot-task, return it to available pool
     if assigned_stock_id:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL WHERE id=$1", assigned_stock_id)
@@ -605,16 +604,22 @@ async def get_submissions_card(uid: int):
             if st == "approved":
                 card += "🟢 Status: <b>✅ Verified & Credited</b>\n"
             elif st == "rejected":
-                card += f"🔴 Status: <b>Rejected</b>\n"
+                card += "🔴 Status: <b>Rejected</b>\n"
                 card += f"⚠️ Reason: <i>{html.escape(row['rejection_reason'] or 'Credentials Failed')}</i>\n"
-                card += f"🔑 Pass: <code>{html.escape(row['password'])}</code> | Rec: <code>{html.escape(row['recovery'])}</code>\n"
-                if row['two_fa'] != 'None':
-                    card += f"🔐 2FA: <code>{html.escape(row['two_fa'])}</code>\n"
+                card += f"🔑 Pass: <code>{html.escape(row['password'])}</code>"
+                if row['recovery'] and row['recovery'] != 'None':
+                    card += f" | Rec: <code>{html.escape(row['recovery'])}</code>"
+                if row['two_fa'] and row['two_fa'] != 'None':
+                    card += f"\n🔐 2FA: <code>{html.escape(row['two_fa'])}</code>"
+                card += "\n"
             else:
                 card += "⏳ Status: <b>In Review Queue</b>\n"
-                card += f"🔑 Pass: <code>{html.escape(row['password'])}</code> | Rec: <code>{html.escape(row['recovery'])}</code>\n"
-                if row['two_fa'] != 'None':
-                    card += f"🔐 2FA: <code>{html.escape(row['two_fa'])}</code>\n"
+                card += f"🔑 Pass: <code>{html.escape(row['password'])}</code>"
+                if row['recovery'] and row['recovery'] != 'None':
+                    card += f" | Rec: <code>{html.escape(row['recovery'])}</code>"
+                if row['two_fa'] and row['two_fa'] != 'None':
+                    card += f"\n🔐 2FA: <code>{html.escape(row['two_fa'])}</code>"
+                card += "\n"
 
             card += "────────────────────────\n"
 
@@ -658,35 +663,7 @@ async def submit_start_mode(message: types.Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=kb_sub_mode())
     await state.set_state(SubmitState.choosing_mode)
 
-@dp.message(SubmitState.choosing_mode, F.text == "📁 Readymade Gmail")
-async def submit_premade_mode(message: types.Message, state: FSMContext):
-    r_ready = await get_setting("rate_readymade", 12.0)
-    await state.update_data(acc_type="Readymade")
-    await message.answer(
-        f"📁 <b>Readymade Account Submission (Rate: ₹{r_ready:.2f})</b>\n\n"
-        "📧 <b>Please enter your Gmail address:</b>\n"
-        "<i>(e.g. <code>username123@gmail.com</code>)</i>",
-        parse_mode="HTML",
-        reply_markup=kb_cancel()
-    )
-    await state.set_state(SubmitState.waiting_for_email)
-
-@dp.message(SubmitState.waiting_for_email)
-async def submit_get_email(message: types.Message, state: FSMContext):
-    email = message.text.strip()
-    if "@gmail.com" not in email.lower():
-        await message.answer("⚠️ <b>Invalid Email:</b> Must end with <code>@gmail.com</code>. Try again:", parse_mode="HTML")
-        return
-    await state.update_data(email=email)
-    await message.answer("🔑 <b>Please enter the Password for this account:</b>", parse_mode="HTML", reply_markup=kb_cancel())
-    await state.set_state(SubmitState.waiting_for_password)
-
-@dp.message(SubmitState.waiting_for_password)
-async def submit_get_password(message: types.Message, state: FSMContext):
-    await state.update_data(password=message.text.strip())
-    await prompt_recovery_step(message, state)
-
-# --- BOT TASK WORKFLOW WITH DONE / CANCEL BUTTONS ---
+# ----------------- FLOW 1: BOT TASK ACCOUNT (INSTANT DONE) -----------------
 @dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
 async def submit_task_mode(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -716,31 +693,101 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
         password=row['password']
     )
 
+    # Clean display format as requested
     task_card = (
-        f"First name: {html.escape(row['first_name'])}\n"
-        f"Last name: {html.escape(row['last_name'])}\n"
-        "---------\n"
-        "Date of birth\n"
-        f"Month: {html.escape(row['dob_month'])} | Day: {html.escape(str(row['dob_day']))} | Year: {html.escape(str(row['dob_year']))}\n"
-        "---------\n"
-        f"Email: {html.escape(row['email'])}\n"
-        "---------\n"
-        f"Password: {html.escape(row['password'])}\n"
-        "---------\n"
-        f"💰 <b>Reward:</b> ₹{r_bot:.2f} per verified account\n\n"
-        "🔒 <b>Be sure to use the specified data, otherwise the account will not be paid.</b>\n\n"
-        "➡️ Create this Gmail on Google, then tap <b>✅ Done / Created</b> below:"
+        f"⚡ <b>Target Registration Credentials (Reward: ₹{r_bot:.2f}):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• First Name   : <code>{html.escape(row['first_name'])}</code>\n"
+        f"• Last Name    : <code>{html.escape(row['last_name'])}</code>\n"
+        f"• Date of Birth: <code>{html.escape(row['dob_month'])} {html.escape(str(row['dob_day']))}, {html.escape(str(row['dob_year']))}</code>\n"
+        f"• Suggested Mail: <code>{html.escape(row['email'])}</code>\n"
+        f"• Password     : <code>{html.escape(row['password'])}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ <b>Strict Requirement:</b> Use the exact credentials above, otherwise payment will be rejected.\n\n"
+        "➡️ Once created, simply tap <b>✅ Done / Created</b> below:"
     )
     await message.answer(task_card, parse_mode="HTML", reply_markup=kb_bot_task_action())
     await state.set_state(SubmitState.waiting_for_task_action)
 
 @dp.message(SubmitState.waiting_for_task_action, F.text == "✅ Done / Created")
 async def bot_task_done_clicked(message: types.Message, state: FSMContext):
-    # User confirmed account creation, proceed straight to recovery step
-    await prompt_recovery_step(message, state)
+    # For Bot Task: Direct instant submission, NO recovery / 30-day / 2FA prompts!
+    data = await state.get_data()
+    email = data["email"]
+    pwd = data["password"]
+    acc_type = data["acc_type"]
+    user = message.from_user
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
-# --- RECOVERY & 2FA STEPS ---
-async def prompt_recovery_step(message: types.Message, state: FSMContext):
+    await ensure_user(user.id, user.username or user.first_name)
+
+    async with db_pool.acquire() as conn:
+        sub_id = await conn.fetchval("""
+            INSERT INTO submissions (user_id, acc_type, email, password, recovery, two_fa, is_old, status, created_at)
+            VALUES ($1, $2, $3, $4, 'None', 'None', 'Fresh (Task)', 'pending', $5) RETURNING id
+        """, user.id, acc_type, email, pwd, now_str)
+        await conn.execute("UPDATE users SET total_submitted = total_submitted + 1 WHERE user_id=$1", user.id)
+
+    r_est = await get_setting("rate_botdata", 15.0)
+
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{sub_id}"),
+        InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{sub_id}")
+    ]])
+
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"📥 <b>New Bot Task Submission #{sub_id}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
+            f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n\n"
+            f"📧 Email    : <code>{html.escape(email)}</code>\n"
+            f"🔑 Password : <code>{html.escape(pwd)}</code>\n"
+            f"📅 Submitted: {now_str}"
+        ),
+        parse_mode="HTML",
+        reply_markup=admin_kb
+    )
+
+    confirm_card = (
+        "✅ <b>Task Submitted Successfully!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 Email   : <code>{html.escape(email)}</code>\n"
+        f"💵 Payout  : <b>₹{r_est:.2f}</b> (Upon verification)\n"
+        "⏳ Status  : <b>Under Review Queue</b>\n\n"
+        "Track live progress inside <b>📊 My Submissions</b>."
+    )
+    await message.answer(confirm_card, parse_mode="HTML", reply_markup=kb_main_menu())
+    await state.clear()
+
+# ----------------- FLOW 2: READYMADE GMAIL (FULL CHECKS) -----------------
+@dp.message(SubmitState.choosing_mode, F.text == "📁 Readymade Gmail")
+async def submit_premade_mode(message: types.Message, state: FSMContext):
+    r_ready = await get_setting("rate_readymade", 12.0)
+    await state.update_data(acc_type="Readymade")
+    await message.answer(
+        f"📁 <b>Readymade Account Submission (Rate: ₹{r_ready:.2f})</b>\n\n"
+        "📧 <b>Please enter your Gmail address:</b>\n"
+        "<i>(e.g. <code>username123@gmail.com</code>)</i>",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
+    )
+    await state.set_state(SubmitState.waiting_for_email)
+
+@dp.message(SubmitState.waiting_for_email)
+async def submit_get_email(message: types.Message, state: FSMContext):
+    email = message.text.strip()
+    if "@gmail.com" not in email.lower():
+        await message.answer("⚠️ <b>Invalid Email:</b> Must end with <code>@gmail.com</code>. Try again:", parse_mode="HTML")
+        return
+    await state.update_data(email=email)
+    await message.answer("🔑 <b>Please enter the Password for this account:</b>", parse_mode="HTML", reply_markup=kb_cancel())
+    await state.set_state(SubmitState.waiting_for_password)
+
+@dp.message(SubmitState.waiting_for_password)
+async def submit_get_password(message: types.Message, state: FSMContext):
+    await state.update_data(password=message.text.strip())
     await message.answer(
         "🛡 <b>Recovery Email Check:</b>\nIf linked, send the recovery address below or tap <b>Skip</b>.",
         parse_mode="HTML",
@@ -783,7 +830,7 @@ async def submit_get_age(message: types.Message, state: FSMContext):
 @dp.message(SubmitState.waiting_for_2fa_choice, F.text == "⚡ Submit Without 2FA")
 async def submit_finish_no_2fa(message: types.Message, state: FSMContext):
     await state.update_data(two_fa="None")
-    await finalize_submission(message, state)
+    await finalize_readymade_submission(message, state)
 
 @dp.message(SubmitState.waiting_for_2fa_choice, F.text == "🔐 Add 2FA Secret Key (Faster Payout)")
 async def submit_req_2fa(message: types.Message, state: FSMContext):
@@ -793,9 +840,9 @@ async def submit_req_2fa(message: types.Message, state: FSMContext):
 @dp.message(SubmitState.waiting_for_2fa_key)
 async def submit_finish_with_2fa(message: types.Message, state: FSMContext):
     await state.update_data(two_fa=message.text.strip())
-    await finalize_submission(message, state)
+    await finalize_readymade_submission(message, state)
 
-async def finalize_submission(message: types.Message, state: FSMContext):
+async def finalize_readymade_submission(message: types.Message, state: FSMContext):
     data = await state.get_data()
     acc_type = data["acc_type"]
     email = data["email"]
@@ -815,7 +862,7 @@ async def finalize_submission(message: types.Message, state: FSMContext):
         """, user.id, acc_type, email, pwd, rec, two_fa, is_old, now_str)
         await conn.execute("UPDATE users SET total_submitted = total_submitted + 1 WHERE user_id=$1", user.id)
 
-    r_est = await (get_setting("rate_botdata", 15.0) if "Bot" in acc_type else get_setting("rate_readymade", 12.0))
+    r_est = await get_setting("rate_readymade", 12.0)
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{sub_id}"),
@@ -825,7 +872,7 @@ async def finalize_submission(message: types.Message, state: FSMContext):
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            f"📥 <b>New Submission #{sub_id}</b>\n"
+            f"📥 <b>New Readymade Submission #{sub_id}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
             f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n"
@@ -1057,8 +1104,8 @@ async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     msg = (
-        "📥 <b>Upload Task Stock (Both Formats Supported):</b>\n\n"
-        "<b>Format A (WhatsApp/Card Style):</b>\n"
+        "📥 <b>Upload Task Stock (WhatsApp / Plain Format):</b>\n\n"
+        "<b>Accepted Format:</b>\n"
         "<code>First name: John\n"
         "Last name: Krum\n"
         "---------\n"
@@ -1068,8 +1115,6 @@ async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
         "Email: johnkrumb623@gmail.com\n"
         "---------\n"
         "Password: 9VQZqgHRv6WU</code>\n\n"
-        "<b>Format B (Single Line):</b>\n"
-        "<code>FirstName|LastName|Month|Day|Year|Email|Password</code>\n\n"
         "Paste your batch below:"
     )
     await call.message.answer(msg, parse_mode="HTML")
@@ -1084,7 +1129,6 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
     added = 0
 
     async with db_pool.acquire() as conn:
-        # Check if Format A (Card format) is present
         if "first name:" in text.lower() and "email:" in text.lower():
             blocks = re.split(r'(?i)(?=First\s*name\s*:)', text)
             for block in blocks:
@@ -1118,7 +1162,6 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
                     except Exception:
                         pass
         else:
-            # Fallback: Format B (Pipe-separated lines)
             lines = text.split("\n")
             for line in lines:
                 parts = [p.strip() for p in line.split("|")]
@@ -1241,7 +1284,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH UNIVERSAL STOCK & CLEAN FLOW 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH CLEAN TASK WORKFLOW 🔥")
 
     await dp.start_polling(bot)
 
