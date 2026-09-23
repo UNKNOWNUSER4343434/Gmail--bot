@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     password TEXT,
     recovery TEXT,
     two_fa TEXT,
-    status TEXT DEFAULT 'Pending',
+    status TEXT DEFAULT 'pending',
     rejection_reason TEXT DEFAULT ''
 )
 """)
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     user_id INTEGER,
     amount REAL,
     upi_id TEXT,
-    status TEXT DEFAULT 'Pending'
+    status TEXT DEFAULT 'pending'
 )
 """)
 
@@ -203,7 +203,7 @@ async def support_handler(message: types.Message):
   )
 
 
-# ======================= SEPARATE SUBMISSIONS STATUS PAGE =======================
+# ======================= SUBMISSIONS STATUS PAGE =======================
 @dp.message(F.text == "📊 My Submissions")
 async def submissions_status_page(message: types.Message):
   user_id = message.from_user.id
@@ -214,19 +214,22 @@ async def submissions_status_page(message: types.Message):
   total = cursor.fetchone()[0]
 
   cursor.execute(
-      "SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='Pending'",
+      "SELECT COUNT(*) FROM submissions WHERE user_id=? AND LOWER(status) ="
+      " 'pending'",
       (user_id,),
   )
   pending = cursor.fetchone()[0]
 
   cursor.execute(
-      "SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='Approved'",
+      "SELECT COUNT(*) FROM submissions WHERE user_id=? AND LOWER(status) ="
+      " 'approved'",
       (user_id,),
   )
   approved = cursor.fetchone()[0]
 
   cursor.execute(
-      "SELECT COUNT(*) FROM submissions WHERE user_id=? AND status='Rejected'",
+      "SELECT COUNT(*) FROM submissions WHERE user_id=? AND LOWER(status) ="
+      " 'rejected'",
       (user_id,),
   )
   rejected = cursor.fetchone()[0]
@@ -250,9 +253,10 @@ async def submissions_status_page(message: types.Message):
     text += "<i>No submissions found yet.</i>\n"
   else:
     for s_mail, s_status, s_reason in recent_subs:
-      if s_status == "Approved":
+      st = s_status.lower()
+      if st == "approved":
         tag = "✅ Approved"
-      elif s_status == "Rejected":
+      elif st == "rejected":
         tag = f"❌ Rejected ({s_reason})" if s_reason else "❌ Rejected"
       else:
         tag = "⏳ Pending"
@@ -261,7 +265,7 @@ async def submissions_status_page(message: types.Message):
   await message.answer(text, parse_mode="HTML")
 
 
-# ======================= CLEAN WALLET DASHBOARD =======================
+# ======================= WALLET DASHBOARD =======================
 @dp.message(F.text == "💼 My Wallet")
 async def wallet_dashboard(message: types.Message):
   user_id = message.from_user.id
@@ -287,7 +291,9 @@ async def wallet_dashboard(message: types.Message):
     text += "<i>No withdrawal requests yet.</i>\n"
   else:
     for w_amt, w_upi, w_status in withdrawals:
-      w_tag = "✅ Paid" if w_status == "Paid" else "⏳ Pending Review"
+      w_tag = (
+          "✅ Paid" if w_status.lower() == "paid" else "⏳ Pending Review"
+      )
       text += f"• ₹{w_amt:.2f} via <code>{w_upi}</code> ➔ {w_tag}\n"
 
   kb = InlineKeyboardMarkup(
@@ -337,7 +343,7 @@ async def process_withdrawal_request(message: types.Message, state: FSMContext):
   cursor.execute("UPDATE users SET balance=0.0 WHERE user_id=?", (user_id,))
   cursor.execute(
       "INSERT INTO withdrawals (user_id, amount, upi_id, status) VALUES (?,"
-      " ?, ?, 'Pending')",
+      " ?, ?, 'pending')",
       (user_id, balance, upi),
   )
   w_id = cursor.lastrowid
@@ -381,7 +387,7 @@ async def mark_payout_complete(call: types.CallbackQuery):
   amt = amt_row[0] if amt_row else 0.0
 
   cursor.execute(
-      "UPDATE withdrawals SET status='Paid' WHERE id=?", (w_id,)
+      "UPDATE withdrawals SET status='paid' WHERE id=?", (w_id,)
   )
   conn.commit()
 
@@ -605,7 +611,7 @@ async def finalize_submission(msg_obj, user, state: FSMContext):
   cursor.execute(
       """
         INSERT INTO submissions (user_id, acc_type, email, password, recovery, two_fa, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'Pending')
+        VALUES (?, ?, ?, ?, ?, ?, 'pending')
     """,
       (user.id, acc_type, email, pwd, rec, two_fa),
   )
@@ -662,7 +668,7 @@ async def admin_approve_submission(call: types.CallbackQuery):
   )
   row = cursor.fetchone()
 
-  if not row or row[2] != "Pending":
+  if not row or str(row[2]).lower() != "pending":
     await call.answer("This task has already been processed.", show_alert=True)
     return
 
@@ -670,7 +676,7 @@ async def admin_approve_submission(call: types.CallbackQuery):
   rate = get_rate()
 
   cursor.execute(
-      "UPDATE submissions SET status='Approved' WHERE id=?", (sub_id,)
+      "UPDATE submissions SET status='approved' WHERE id=?", (sub_id,)
   )
   cursor.execute(
       "UPDATE users SET balance = balance + ? WHERE user_id=?", (rate, uid)
@@ -703,7 +709,7 @@ async def admin_reject_start(call: types.CallbackQuery, state: FSMContext):
   cursor.execute("SELECT status FROM submissions WHERE id=?", (sub_id,))
   row = cursor.fetchone()
 
-  if not row or row[0] != "Pending":
+  if not row or str(row[0]).lower() != "pending":
     await call.answer("This task has already been processed.", show_alert=True)
     return
 
@@ -722,7 +728,10 @@ async def admin_reject_save(message: types.Message, state: FSMContext):
   if message.from_user.id != ADMIN_ID:
     return
   data = await state.get_data()
-  sub_id = data["target_sub_id"]
+  sub_id = data.get("target_sub_id")
+  if not sub_id:
+    return
+
   reason = message.text.strip()
 
   cursor.execute(
@@ -733,7 +742,7 @@ async def admin_reject_save(message: types.Message, state: FSMContext):
   if row:
     uid, mail = row
     cursor.execute(
-        "UPDATE submissions SET status='Rejected', rejection_reason=? WHERE"
+        "UPDATE submissions SET status='rejected', rejection_reason=? WHERE"
         " id=?",
         (reason, sub_id),
     )
@@ -768,7 +777,9 @@ async def admin_control_panel(message: types.Message):
   cursor.execute("SELECT COUNT(*) FROM users")
   total_users = cursor.fetchone()[0]
 
-  cursor.execute("SELECT COUNT(*) FROM submissions WHERE status='Pending'")
+  cursor.execute(
+      "SELECT COUNT(*) FROM submissions WHERE LOWER(status)='pending'"
+  )
   pending_subs = cursor.fetchone()[0]
 
   available_stock = get_available_stock_count()
