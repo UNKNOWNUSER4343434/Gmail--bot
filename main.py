@@ -236,13 +236,13 @@ def kb_2fa():
 # ======================= FSM STATES =======================
 class SubmitState(StatesGroup):
     choosing_mode = State()
-    waiting_for_task_action = State()  # Done / Cancel for bot task
-    waiting_for_email = State()        # For readymade
-    waiting_for_password = State()     # For readymade
-    waiting_for_recovery = State()     # For readymade
-    waiting_for_age = State()          # For readymade
-    waiting_for_2fa_choice = State()   # For readymade
-    waiting_for_2fa_key = State()      # For readymade
+    waiting_for_task_action = State()
+    waiting_for_email = State()
+    waiting_for_password = State()
+    waiting_for_recovery = State()
+    waiting_for_age = State()
+    waiting_for_2fa_choice = State()
+    waiting_for_2fa_key = State()
 
 class WithdrawState(StatesGroup):
     waiting_for_upi = State()
@@ -593,12 +593,12 @@ async def get_submissions_card(uid: int):
     if not subs:
         card += "<i>No accounts submitted yet.</i>\n"
     else:
-        for idx, row in enumerate(subs, 1):
+        for row in subs:
             st = str(row['status']).lower()
             acc_type = "Task" if "Bot" in str(row['acc_type']) else "Ready"
             time_str = row['created_at'] or "Recent"
 
-            card += f"<b>#{idx} • {html.escape(row['email'])}</b> [{acc_type}]\n"
+            card += f"<b>SUB #{row['id']} • {html.escape(row['email'])}</b> [{acc_type}]\n"
             card += f"📅 Submitted: <code>{time_str}</code>\n"
 
             if st == "approved":
@@ -663,7 +663,7 @@ async def submit_start_mode(message: types.Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=kb_sub_mode())
     await state.set_state(SubmitState.choosing_mode)
 
-# ----------------- FLOW 1: BOT TASK ACCOUNT (INSTANT DONE) -----------------
+# ----------------- FLOW 1: BOT TASK ACCOUNT -----------------
 @dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
 async def submit_task_mode(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -685,7 +685,6 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
         stock_id = row['id']
         await conn.execute("UPDATE task_stock SET status='assigned', assigned_to=$1 WHERE id=$2", uid, stock_id)
 
-    # Store assigned credentials in FSM state
     await state.update_data(
         acc_type="Bot-Data Task",
         assigned_stock_id=stock_id,
@@ -693,7 +692,6 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
         password=row['password']
     )
 
-    # Clean display format as requested
     task_card = (
         f"⚡ <b>Target Registration Credentials (Reward: ₹{r_bot:.2f}):</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -711,7 +709,6 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
 
 @dp.message(SubmitState.waiting_for_task_action, F.text == "✅ Done / Created")
 async def bot_task_done_clicked(message: types.Message, state: FSMContext):
-    # For Bot Task: Direct instant submission, NO recovery / 30-day / 2FA prompts!
     data = await state.get_data()
     email = data["email"]
     pwd = data["password"]
@@ -738,8 +735,9 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            f"📥 <b>New Bot Task Submission #{sub_id}</b>\n"
+            f"📥 <b>New Submission Alert [SUB #{sub_id}]</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Submission ID: <b>SUB #{sub_id}</b>\n"
             f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
             f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n\n"
             f"📧 Email    : <code>{html.escape(email)}</code>\n"
@@ -753,15 +751,16 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
     confirm_card = (
         "✅ <b>Task Submitted Successfully!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📧 Email   : <code>{html.escape(email)}</code>\n"
-        f"💵 Payout  : <b>₹{r_est:.2f}</b> (Upon verification)\n"
-        "⏳ Status  : <b>Under Review Queue</b>\n\n"
+        f"🆔 <b>Submission ID : SUB #{sub_id}</b>\n"
+        f"📧 Email         : <code>{html.escape(email)}</code>\n"
+        f"💵 Payout        : <b>₹{r_est:.2f}</b> (Upon verification)\n"
+        "⏳ Status        : <b>Under Review Queue</b>\n\n"
         "Track live progress inside <b>📊 My Submissions</b>."
     )
     await message.answer(confirm_card, parse_mode="HTML", reply_markup=kb_main_menu())
     await state.clear()
 
-# ----------------- FLOW 2: READYMADE GMAIL (FULL CHECKS) -----------------
+# ----------------- FLOW 2: READYMADE GMAIL -----------------
 @dp.message(SubmitState.choosing_mode, F.text == "📁 Readymade Gmail")
 async def submit_premade_mode(message: types.Message, state: FSMContext):
     r_ready = await get_setting("rate_readymade", 12.0)
@@ -872,8 +871,9 @@ async def finalize_readymade_submission(message: types.Message, state: FSMContex
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            f"📥 <b>New Readymade Submission #{sub_id}</b>\n"
+            f"📥 <b>New Submission Alert [SUB #{sub_id}]</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Submission ID: <b>SUB #{sub_id}</b>\n"
             f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
             f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n"
             f"📅 Vintage (>30 Days): <b>{is_old}</b>\n\n"
@@ -890,9 +890,10 @@ async def finalize_readymade_submission(message: types.Message, state: FSMContex
     confirm_card = (
         "✅ <b>Account Submitted Successfully!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📧 Email   : <code>{html.escape(email)}</code>\n"
-        f"💵 Payout  : <b>₹{r_est:.2f}</b> (Upon verification)\n"
-        "⏳ Status  : <b>Under Review Queue</b>\n\n"
+        f"🆔 <b>Submission ID : SUB #{sub_id}</b>\n"
+        f"📧 Email         : <code>{html.escape(email)}</code>\n"
+        f"💵 Payout        : <b>₹{r_est:.2f}</b> (Upon verification)\n"
+        "⏳ Status        : <b>Under Review Queue</b>\n\n"
         "Track live progress inside <b>📊 My Submissions</b>."
     )
     await message.answer(confirm_card, parse_mode="HTML", reply_markup=kb_main_menu())
@@ -925,7 +926,7 @@ async def admin_accept_sub(call: types.CallbackQuery):
             try:
                 await bot.send_message(
                     chat_id=referrer,
-                    text=f"💎 <b>Referral Bonus!</b> Earned <b>₹{ref_bonus:.2f}</b> from a referral submission."
+                    text=f"💎 <b>Referral Bonus!</b> Earned <b>₹{ref_bonus:.2f}</b> from referral SUB #{sub_id}."
                 )
             except Exception:
                 pass
@@ -936,6 +937,7 @@ async def admin_accept_sub(call: types.CallbackQuery):
             text=(
                 f"🎉 <b>Account Verified & Approved!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 Submission: <b>SUB #{sub_id}</b>\n"
                 f"📧 Account: <code>{html.escape(mail)}</code>\n"
                 f"💵 Reward Credited: <b>+₹{reward:.2f}</b>\n"
                 f"💼 Updated Balance: <b>₹{float(new_bal):.2f}</b>\n"
@@ -1003,6 +1005,7 @@ async def admin_reject_quick(call: types.CallbackQuery):
             text=(
                 f"🔴 <b>Submission Disqualified</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 Submission: <b>SUB #{sub_id}</b>\n"
                 f"📧 Account: <code>{html.escape(mail)}</code>\n"
                 f"⚠️ Reason: <b>{html.escape(reason)}</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1020,7 +1023,7 @@ async def admin_reject_quick(call: types.CallbackQuery):
 async def admin_reject_custom_start(call: types.CallbackQuery, state: FSMContext):
     sub_id = int(call.data.split("_")[1])
     await state.update_data(target_sub_id=sub_id)
-    await call.message.reply(f"✏️ <b>Enter custom rejection reason for #{sub_id}:</b>", parse_mode="HTML")
+    await call.message.reply(f"✏️ <b>Enter custom rejection reason for SUB #{sub_id}:</b>", parse_mode="HTML")
     await state.set_state(AdminState.waiting_for_custom_reject)
     await call.answer()
 
@@ -1044,6 +1047,7 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
                     text=(
                         f"🔴 <b>Submission Disqualified</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🆔 Submission: <b>SUB #{sub_id}</b>\n"
                         f"📧 Account: <code>{html.escape(mail)}</code>\n"
                         f"⚠️ Reason: <b>{html.escape(reason)}</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1054,10 +1058,10 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
             except Exception:
                 pass
 
-    await message.answer(f"✅ Disqualified #{sub_id} with reason: <b>{html.escape(reason)}</b>", parse_mode="HTML")
+    await message.answer(f"✅ SUB #{sub_id} rejected with reason: <b>{html.escape(reason)}</b>", parse_mode="HTML")
     await state.clear()
 
-# ======================= ADMIN CONTROL DASHBOARD & UNIVERSAL STOCK PARSER =======================
+# ======================= ADMIN DASHBOARD & STOCK PARSER =======================
 @dp.message(Command("admin"))
 async def admin_terminal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1284,7 +1288,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH CLEAN TASK WORKFLOW 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH SUB ID TRACKING 🔥")
 
     await dp.start_polling(bot)
 
