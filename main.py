@@ -113,7 +113,7 @@ async def init_db():
             INSERT INTO settings (key, value) VALUES ('rate_botdata', '15.0') ON CONFLICT (key) DO NOTHING;
             INSERT INTO settings (key, value) VALUES ('ref_bonus', '1.0') ON CONFLICT (key) DO NOTHING;
         """)
-    print("Database connection and tables ready!")
+    print("Database connection ready!")
 
 async def get_setting(key: str, default: float = 15.0):
     async with db_pool.acquire() as conn:
@@ -144,14 +144,39 @@ async def ensure_user(user_id: int, username: str = "", referrer_id: int = None)
         else:
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2", username, user_id)
 
-# ======================= KEYBOARDS IN ENGLISH =======================
+# ======================= BROADCAST SYSTEM =======================
+async def broadcast_price_update(label: str, new_price: float):
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users")
+
+    broadcast_msg = (
+        "🚀 <b>PRICE UPDATE ALERT!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"The reward rate for <b>{label}</b> has been updated to:\n\n"
+        f"💰 <b>₹{new_price:.2f} per account!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Tap <b>⚡ Submit Gmail Account</b> below to start earning at the new rate!"
+    )
+
+    sent = 0
+    for u in users:
+        uid = u['user_id']
+        try:
+            await bot.send_message(chat_id=uid, text=broadcast_msg, parse_mode="HTML")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    return sent
+
+# ======================= KEYBOARDS =======================
 def kb_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="⚡ Submit Gmail Account")],
             [KeyboardButton(text="📊 My Submissions"), KeyboardButton(text="💼 My Wallet")],
-            [KeyboardButton(text="👥 Refer & Earn"), KeyboardButton(text="📦 Task Stock")],
-            [KeyboardButton(text="📢 Official Channel"), KeyboardButton(text="💬 24/7 Support")]
+            [KeyboardButton(text="👥 Refer & Earn"), KeyboardButton(text="📢 Official Channel")],
+            [KeyboardButton(text="💬 24/7 Support")]
         ],
         resize_keyboard=True
     )
@@ -160,6 +185,15 @@ def kb_sub_mode():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📁 Readymade Gmail"), KeyboardButton(text="⚡ Bot Task Account")],
+            [KeyboardButton(text="❌ Cancel")]
+        ],
+        resize_keyboard=True
+    )
+
+def kb_bot_task_action():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Done / Created")],
             [KeyboardButton(text="❌ Cancel")]
         ],
         resize_keyboard=True
@@ -202,8 +236,9 @@ def kb_2fa():
 # ======================= FSM STATES =======================
 class SubmitState(StatesGroup):
     choosing_mode = State()
-    waiting_for_email = State()
-    waiting_for_password = State()
+    waiting_for_task_action = State()  # Done / Cancel for bot task
+    waiting_for_email = State()        # For readymade flow
+    waiting_for_password = State()     # For readymade flow
     waiting_for_recovery = State()
     waiting_for_age = State()
     waiting_for_2fa_choice = State()
@@ -224,6 +259,14 @@ class AdminState(StatesGroup):
 # ======================= CANCEL ACTION =======================
 @dp.message(F.text == "❌ Cancel")
 async def cancel_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    assigned_stock_id = data.get("assigned_stock_id")
+    
+    # If user cancels a reserved bot-task, return it to available pool
+    if assigned_stock_id:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL WHERE id=$1", assigned_stock_id)
+
     await state.clear()
     await message.answer("🔄 Operation cancelled. Returning to main menu:", reply_markup=kb_main_menu())
 
@@ -259,7 +302,7 @@ async def support_handler(message: types.Message):
     await message.answer(
         f"💬 <b>Direct Support:</b>\n"
         f"• Support Manager: {SUPPORT_USER}\n"
-        f"• Community Updates: {CHANNEL_LINK}\n\n"
+        f"• Community Channel: {CHANNEL_LINK}\n\n"
         "Reach out directly for any account or payout inquiries.",
         parse_mode="HTML"
     )
@@ -267,20 +310,7 @@ async def support_handler(message: types.Message):
 @dp.message(F.text == "📢 Official Channel")
 async def channel_handler(message: types.Message):
     await message.answer(
-        f"📢 <b>Official Telegram Channel:</b>\n{CHANNEL_LINK}\n\nFollow us for real-time payment proofs and price changes.",
-        parse_mode="HTML"
-    )
-
-@dp.message(F.text == "📦 Task Stock")
-async def task_stock_handler(message: types.Message):
-    slots = await get_available_stock_count()
-    r_bot = await get_setting("rate_botdata", 15.0)
-    await message.answer(
-        f"📦 <b>Bot Task Allocations:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <b>Available Task Slots:</b> <b>{slots}</b> accounts ready\n"
-        f"💵 <b>Current Rate:</b> ₹{r_bot:.2f} per verified account\n\n"
-        "<i>Tap '⚡ Submit Gmail Account' and choose Bot Task to claim your credentials.</i>",
+        f"📢 <b>Official Telegram Channel:</b>\n{CHANNEL_LINK}\n\nFollow for real-time payment proofs and notices.",
         parse_mode="HTML"
     )
 
@@ -297,10 +327,10 @@ async def refer_handler(message: types.Message):
     text = (
         "👥 <b>Affiliate Program</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Invite your friends and suppliers to earn passive commission!\n\n"
+        "Invite suppliers and friends to earn passive commission!\n\n"
         f"• Total Referrals: <b>{count or 0}</b> users\n"
         f"• Commission: <b>₹{bonus:.2f}</b> on every approved account\n\n"
-        "🔗 <b>Your Invite Link:</b>\n"
+        "🔗 <b>Your Referral Link:</b>\n"
         f"<code>{link}</code>"
     )
     await message.answer(text, parse_mode="HTML")
@@ -426,7 +456,6 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
         return
 
     uid = message.from_user.id
-    # Auto-generate unique order ID
     order_id = f"GMA-W-{random.randint(10000, 99999)}"
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
@@ -642,43 +671,6 @@ async def submit_premade_mode(message: types.Message, state: FSMContext):
     )
     await state.set_state(SubmitState.waiting_for_email)
 
-@dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
-async def submit_task_mode(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    r_bot = await get_setting("rate_botdata", 15.0)
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, first_name, last_name, dob_month, dob_day, dob_year, email, password
-            FROM task_stock WHERE status='available' LIMIT 1
-        """)
-        if not row:
-            await message.answer(
-                "⚠️ <b>Task Stock Empty!</b>\nAll bot-data tasks are currently claimed. Please use 'Readymade Gmail' or wait for restock.",
-                reply_markup=kb_main_menu()
-            )
-            await state.clear()
-            return
-
-        stock_id = row['id']
-        await conn.execute("UPDATE task_stock SET status='assigned', assigned_to=$1 WHERE id=$2", uid, stock_id)
-
-    await state.update_data(acc_type="Bot-Data Task")
-    task_card = (
-        f"⚡ <b>Target Registration Credentials (Reward: ₹{r_bot:.2f}):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• First Name   : <code>{html.escape(row['first_name'])}</code>\n"
-        f"• Last Name    : <code>{html.escape(row['last_name'])}</code>\n"
-        f"• Date of Birth: <code>{html.escape(row['dob_month'])} {html.escape(str(row['dob_day']))}, {html.escape(str(row['dob_year']))}</code>\n"
-        f"• Suggested Mail: <code>{html.escape(row['email'])}</code>\n"
-        f"• Password     : <code>{html.escape(row['password'])}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ <b>Strict Requirement:</b> Use the exact credentials above, otherwise payment will be rejected.\n\n"
-        "➡️ <b>Once created, enter the registered Email Address below:</b>"
-    )
-    await message.answer(task_card, parse_mode="HTML", reply_markup=kb_cancel())
-    await state.set_state(SubmitState.waiting_for_email)
-
 @dp.message(SubmitState.waiting_for_email)
 async def submit_get_email(message: types.Message, state: FSMContext):
     email = message.text.strip()
@@ -692,6 +684,63 @@ async def submit_get_email(message: types.Message, state: FSMContext):
 @dp.message(SubmitState.waiting_for_password)
 async def submit_get_password(message: types.Message, state: FSMContext):
     await state.update_data(password=message.text.strip())
+    await prompt_recovery_step(message, state)
+
+# --- BOT TASK WORKFLOW WITH DONE / CANCEL BUTTONS ---
+@dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
+async def submit_task_mode(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    r_bot = await get_setting("rate_botdata", 15.0)
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, first_name, last_name, dob_month, dob_day, dob_year, email, password 
+            FROM task_stock WHERE status='available' LIMIT 1
+        """)
+        if not row:
+            await message.answer(
+                "⚠️ <b>Task Stock Empty!</b>\nAll bot-data tasks are currently claimed. Please use 'Readymade Gmail' or wait for restock.",
+                reply_markup=kb_main_menu()
+            )
+            await state.clear()
+            return
+
+        stock_id = row['id']
+        await conn.execute("UPDATE task_stock SET status='assigned', assigned_to=$1 WHERE id=$2", uid, stock_id)
+
+    # Store assigned credentials in FSM state
+    await state.update_data(
+        acc_type="Bot-Data Task",
+        assigned_stock_id=stock_id,
+        email=row['email'],
+        password=row['password']
+    )
+
+    task_card = (
+        f"First name: {html.escape(row['first_name'])}\n"
+        f"Last name: {html.escape(row['last_name'])}\n"
+        "---------\n"
+        "Date of birth\n"
+        f"Month: {html.escape(row['dob_month'])} | Day: {html.escape(str(row['dob_day']))} | Year: {html.escape(str(row['dob_year']))}\n"
+        "---------\n"
+        f"Email: {html.escape(row['email'])}\n"
+        "---------\n"
+        f"Password: {html.escape(row['password'])}\n"
+        "---------\n"
+        f"💰 <b>Reward:</b> ₹{r_bot:.2f} per verified account\n\n"
+        "🔒 <b>Be sure to use the specified data, otherwise the account will not be paid.</b>\n\n"
+        "➡️ Create this Gmail on Google, then tap <b>✅ Done / Created</b> below:"
+    )
+    await message.answer(task_card, parse_mode="HTML", reply_markup=kb_bot_task_action())
+    await state.set_state(SubmitState.waiting_for_task_action)
+
+@dp.message(SubmitState.waiting_for_task_action, F.text == "✅ Done / Created")
+async def bot_task_done_clicked(message: types.Message, state: FSMContext):
+    # User confirmed account creation, proceed straight to recovery step
+    await prompt_recovery_step(message, state)
+
+# --- RECOVERY & 2FA STEPS ---
+async def prompt_recovery_step(message: types.Message, state: FSMContext):
     await message.answer(
         "🛡 <b>Recovery Email Check:</b>\nIf linked, send the recovery address below or tap <b>Skip</b>.",
         parse_mode="HTML",
@@ -961,7 +1010,7 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Disqualified #{sub_id} with reason: <b>{html.escape(reason)}</b>", parse_mode="HTML")
     await state.clear()
 
-# ======================= ADMIN CONTROL DASHBOARD =======================
+# ======================= ADMIN CONTROL DASHBOARD & UNIVERSAL STOCK PARSER =======================
 @dp.message(Command("admin"))
 async def admin_terminal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1008,10 +1057,20 @@ async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     msg = (
-        "📥 <b>Bulk Task Stock Upload:</b>\n\n"
-        "Format per line:\n"
+        "📥 <b>Upload Task Stock (Both Formats Supported):</b>\n\n"
+        "<b>Format A (WhatsApp/Card Style):</b>\n"
+        "<code>First name: John\n"
+        "Last name: Krum\n"
+        "---------\n"
+        "Date of birth\n"
+        "Month: July | Day: 12 | Year: 1986\n"
+        "---------\n"
+        "Email: johnkrumb623@gmail.com\n"
+        "---------\n"
+        "Password: 9VQZqgHRv6WU</code>\n\n"
+        "<b>Format B (Single Line):</b>\n"
         "<code>FirstName|LastName|Month|Day|Year|Email|Password</code>\n\n"
-        "Send your batch now:"
+        "Paste your batch below:"
     )
     await call.message.answer(msg, parse_mode="HTML")
     await state.set_state(AdminState.waiting_for_bulk_stock)
@@ -1021,24 +1080,61 @@ async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
 async def adm_stock_process(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    lines = message.text.strip().split("\n")
+    text = message.text.strip()
     added = 0
 
     async with db_pool.acquire() as conn:
-        for line in lines:
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) == 7:
-                fn, ln, month, day, year, mail, pwd = parts
-                try:
-                    await conn.execute("""
-                        INSERT INTO task_stock (first_name, last_name, dob_month, dob_day, dob_year, email, password)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """, fn, ln, month, day, year, mail, pwd)
-                    added += 1
-                except Exception:
-                    pass
+        # Check if Format A (Card format) is present
+        if "first name:" in text.lower() and "email:" in text.lower():
+            blocks = re.split(r'(?i)(?=First\s*name\s*:)', text)
+            for block in blocks:
+                block = block.strip()
+                if not block:
+                    continue
+                fn_m = re.search(r'(?i)First\s*name\s*:\s*([^\n\r]+)', block)
+                ln_m = re.search(r'(?i)Last\s*name\s*:\s*([^\n\r]+)', block)
+                m_m = re.search(r'(?i)Month\s*:\s*([^|\n\r]+)', block)
+                d_m = re.search(r'(?i)Day\s*:\s*([^|\n\r]+)', block)
+                y_m = re.search(r'(?i)Year\s*:\s*([^\n\r]+)', block)
+                em_m = re.search(r'(?i)Email\s*:\s*([a-zA-Z0-9._%+-]+@gmail\.com)', block)
+                pw_m = re.search(r'(?i)Password\s*:\s*([^\n\r]+)', block)
 
-    await message.answer(f"✅ Added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
+                if fn_m and ln_m and m_m and d_m and y_m and em_m and pw_m:
+                    fn = fn_m.group(1).strip()
+                    ln = ln_m.group(1).strip()
+                    month = m_m.group(1).strip()
+                    day = d_m.group(1).strip()
+                    year = y_m.group(1).strip()
+                    mail = em_m.group(1).strip()
+                    pwd = pw_m.group(1).strip()
+
+                    try:
+                        await conn.execute("""
+                            INSERT INTO task_stock (first_name, last_name, dob_month, dob_day, dob_year, email, password)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            ON CONFLICT (email) DO NOTHING
+                        """, fn, ln, month, day, year, mail, pwd)
+                        added += 1
+                    except Exception:
+                        pass
+        else:
+            # Fallback: Format B (Pipe-separated lines)
+            lines = text.split("\n")
+            for line in lines:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) == 7:
+                    fn, ln, month, day, year, mail, pwd = parts
+                    try:
+                        await conn.execute("""
+                            INSERT INTO task_stock (first_name, last_name, dob_month, dob_day, dob_year, email, password)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            ON CONFLICT (email) DO NOTHING
+                        """, fn, ln, month, day, year, mail, pwd)
+                        added += 1
+                    except Exception:
+                        pass
+
+    await message.answer(f"✅ Successfully added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data.startswith("rate_change_"))
@@ -1072,7 +1168,25 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
             "ref": "ref_bonus"
         }
         await set_setting(key_map[r_type], val)
-        await message.answer(f"✅ Price rate updated to <b>₹{val:.2f}</b> successfully.", parse_mode="HTML")
+        
+        labels = {
+            "readymade": "Readymade Accounts",
+            "botdata": "Bot Task Accounts",
+            "ref": "Referral Bonus"
+        }
+        label_text = labels.get(r_type, "Accounts")
+        
+        broadcast_count = 0
+        if r_type in ["readymade", "botdata"]:
+            broadcast_count = await broadcast_price_update(label_text, val)
+
+        await message.answer(
+            f"✅ <b>Rate Updated!</b>\n"
+            f"• Category: <b>{label_text}</b>\n"
+            f"• New Rate: <b>₹{val:.2f}</b>\n"
+            f"📢 Broadcast sent to <b>{broadcast_count}</b> users.",
+            parse_mode="HTML"
+        )
     except ValueError:
         await message.answer("⚠️ Please provide a valid numerical amount.")
     await state.clear()
@@ -1127,7 +1241,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE IN ENGLISH 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH UNIVERSAL STOCK & CLEAN FLOW 🔥")
 
     await dp.start_polling(bot)
 
