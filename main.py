@@ -40,10 +40,19 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ======================= DATABASE SETUP =======================
-conn = sqlite3.connect("gmail_bot.db", check_same_thread=False)
-cursor = conn.cursor()
+DB_PATH = "gmail_bot.db"
 
-cursor.execute("""
+
+def get_db():
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn.execute("PRAGMA journal_mode=WAL;")
+  return conn
+
+
+init_conn = get_db()
+init_cur = init_conn.cursor()
+
+init_cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
@@ -52,7 +61,7 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-cursor.execute("""
+init_cur.execute("""
 CREATE TABLE IF NOT EXISTS task_stock (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     first_name TEXT,
@@ -67,7 +76,7 @@ CREATE TABLE IF NOT EXISTS task_stock (
 )
 """)
 
-cursor.execute("""
+init_cur.execute("""
 CREATE TABLE IF NOT EXISTS submissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -81,7 +90,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 )
 """)
 
-cursor.execute("""
+init_cur.execute("""
 CREATE TABLE IF NOT EXISTS withdrawals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -91,35 +100,59 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 )
 """)
 
-cursor.execute("""
+init_cur.execute("""
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 )
 """)
-cursor.execute(
-    "INSERT OR IGNORE INTO settings (key, value) VALUES ('rate', '15.0')"
+
+# Default dual rates
+init_cur.execute(
+    "INSERT OR IGNORE INTO settings (key, value) VALUES ('rate_readymade',"
+    " '12.0')"
 )
-conn.commit()
+init_cur.execute(
+    "INSERT OR IGNORE INTO settings (key, value) VALUES ('rate_botdata',"
+    " '15.0')"
+)
+init_conn.commit()
+init_conn.close()
 
 
-def get_rate():
-  cursor.execute("SELECT value FROM settings WHERE key='rate'")
-  return float(cursor.fetchone()[0])
+def get_rate(rate_type="readymade"):
+  conn = get_db()
+  cur = conn.cursor()
+  key = "rate_readymade" if rate_type == "readymade" else "rate_botdata"
+  cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+  row = cur.fetchone()
+  conn.close()
+  return float(row[0]) if row else 15.0
 
 
-def set_rate(new_rate):
-  cursor.execute(
-      "UPDATE settings SET value=? WHERE key='rate'", (str(new_rate),)
+def set_rate(rate_type, new_rate):
+  conn = get_db()
+  cur = conn.cursor()
+  key = "rate_readymade" if rate_type == "readymade" else "rate_botdata"
+  cur.execute(
+      "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+      (key, str(new_rate)),
   )
   conn.commit()
+  conn.close()
+
+
+def get_min_payout():
+  return min(get_rate("readymade"), get_rate("botdata"))
 
 
 def get_available_stock_count():
-  cursor.execute(
-      "SELECT COUNT(*) FROM task_stock WHERE status='available'"
-  )
-  return cursor.fetchone()[0]
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT COUNT(*) FROM task_stock WHERE status='available'")
+  count = cur.fetchone()[0]
+  conn.close()
+  return count
 
 
 # ======================= FSM STATES =======================
@@ -137,6 +170,7 @@ class WithdrawState(StatesGroup):
 
 class AdminState(StatesGroup):
   waiting_for_bulk_stock = State()
+  waiting_for_rate_type = State()
   waiting_for_new_rate = State()
   waiting_for_addbal_id = State()
   waiting_for_addbal_amount = State()
@@ -167,18 +201,25 @@ async def start_handler(message: types.Message):
   user_id = message.from_user.id
   username = message.from_user.username or message.from_user.first_name
 
-  cursor.execute(
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
       "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
       (user_id, username),
   )
   conn.commit()
+  conn.close()
 
-  rate = get_rate()
+  rate_ready = get_rate("readymade")
+  rate_bot = get_rate("botdata")
+
   welcome_text = (
       f"👋 <b>Welcome, {message.from_user.first_name}!</b>\n\n"
-      f"⚡ <b>Earning Rate:</b> ₹{rate:.2f} per verified account\n"
-      "⏱ <b>Verification Window:</b> 24 to 72 Hours max\n\n"
-      "Use the menu below to navigate and earn directly."
+      "⚡ <b>Current Earning Rates:</b>\n"
+      f"• 📋 <b>Bot Data Creation:</b> ₹{rate_bot:.2f} / account\n"
+      f"• 📁 <b>Readymade Account:</b> ₹{rate_ready:.2f} / account\n\n"
+      "⏱ <b>Verification Period:</b> 24 to 72 Hours max\n\n"
+      "Select an option below to get started."
   )
   await message.answer(
       welcome_text, parse_mode="HTML", reply_markup=get_main_menu()
@@ -207,39 +248,42 @@ async def support_handler(message: types.Message):
 @dp.message(F.text == "📊 My Submissions")
 async def submissions_status_page(message: types.Message):
   user_id = message.from_user.id
+  conn = get_db()
+  cur = conn.cursor()
 
-  cursor.execute(
+  cur.execute(
       "SELECT COUNT(*) FROM submissions WHERE user_id=?", (user_id,)
   )
-  total = cursor.fetchone()[0]
+  total = cur.fetchone()[0]
 
-  cursor.execute(
+  cur.execute(
       "SELECT COUNT(*) FROM submissions WHERE user_id=? AND LOWER(status) ="
       " 'pending'",
       (user_id,),
   )
-  pending = cursor.fetchone()[0]
+  pending = cur.fetchone()[0]
 
-  cursor.execute(
+  cur.execute(
       "SELECT COUNT(*) FROM submissions WHERE user_id=? AND LOWER(status) ="
       " 'approved'",
       (user_id,),
   )
-  approved = cursor.fetchone()[0]
+  approved = cur.fetchone()[0]
 
-  cursor.execute(
+  cur.execute(
       "SELECT COUNT(*) FROM submissions WHERE user_id=? AND LOWER(status) ="
       " 'rejected'",
       (user_id,),
   )
-  rejected = cursor.fetchone()[0]
+  rejected = cur.fetchone()[0]
 
-  cursor.execute(
-      "SELECT email, status, rejection_reason FROM submissions WHERE"
+  cur.execute(
+      "SELECT email, status, rejection_reason, acc_type FROM submissions WHERE"
       " user_id=? ORDER BY id DESC LIMIT 10",
       (user_id,),
   )
-  recent_subs = cursor.fetchall()
+  recent_subs = cur.fetchall()
+  conn.close()
 
   text = "📊 <b>Your Account Submissions</b>\n"
   text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -252,15 +296,16 @@ async def submissions_status_page(message: types.Message):
   if not recent_subs:
     text += "<i>No submissions found yet.</i>\n"
   else:
-    for s_mail, s_status, s_reason in recent_subs:
+    for s_mail, s_status, s_reason, s_type in recent_subs:
       st = str(s_status).lower()
+      type_label = "Bot Data" if "Bot" in str(s_type) else "Readymade"
       if st == "approved":
         tag = "✅ Approved"
       elif st == "rejected":
         tag = f"❌ Rejected ({s_reason})" if s_reason else "❌ Rejected"
       else:
         tag = "⏳ Pending"
-      text += f"• <code>{s_mail}</code> ➔ {tag}\n"
+      text += f"• <code>{s_mail}</code> [{type_label}] ➔ {tag}\n"
 
   await message.answer(text, parse_mode="HTML")
 
@@ -269,17 +314,20 @@ async def submissions_status_page(message: types.Message):
 @dp.message(F.text == "💼 My Wallet")
 async def wallet_dashboard(message: types.Message):
   user_id = message.from_user.id
-  cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-  user_row = cursor.fetchone()
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+  user_row = cur.fetchone()
   balance = user_row[0] if user_row else 0.0
-  min_payout = get_rate()
+  min_payout = get_min_payout()
 
-  cursor.execute(
+  cur.execute(
       "SELECT amount, upi_id, status FROM withdrawals WHERE user_id=? ORDER BY"
       " id DESC LIMIT 3",
       (user_id,),
   )
-  withdrawals = cursor.fetchall()
+  withdrawals = cur.fetchall()
+  conn.close()
 
   text = "💼 <b>My Wallet Dashboard</b>\n"
   text += "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -310,10 +358,14 @@ async def wallet_dashboard(message: types.Message):
 @dp.callback_query(F.data == "start_withdraw")
 async def start_withdrawal_flow(call: types.CallbackQuery, state: FSMContext):
   user_id = call.from_user.id
-  cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-  row = cursor.fetchone()
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+  row = cur.fetchone()
+  conn.close()
+
   balance = row[0] if row else 0.0
-  min_payout = get_rate()
+  min_payout = get_min_payout()
 
   if balance < min_payout:
     await call.answer(
@@ -337,17 +389,20 @@ async def process_withdrawal_request(message: types.Message, state: FSMContext):
   upi = message.text.strip()
   user_id = message.from_user.id
 
-  cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-  balance = cursor.fetchone()[0]
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+  balance = cur.fetchone()[0]
 
-  cursor.execute("UPDATE users SET balance=0.0 WHERE user_id=?", (user_id,))
-  cursor.execute(
+  cur.execute("UPDATE users SET balance=0.0 WHERE user_id=?", (user_id,))
+  cur.execute(
       "INSERT INTO withdrawals (user_id, amount, upi_id, status) VALUES (?,"
       " ?, ?, 'pending')",
       (user_id, balance, upi),
   )
-  w_id = cursor.lastrowid
+  w_id = cur.lastrowid
   conn.commit()
+  conn.close()
 
   admin_kb = InlineKeyboardMarkup(
       inline_keyboard=[[
@@ -382,14 +437,15 @@ async def mark_payout_complete(call: types.CallbackQuery):
   _, w_id, uid = call.data.split("_")
   w_id, uid = int(w_id), int(uid)
 
-  cursor.execute("SELECT amount FROM withdrawals WHERE id=?", (w_id,))
-  amt_row = cursor.fetchone()
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT amount FROM withdrawals WHERE id=?", (w_id,))
+  amt_row = cur.fetchone()
   amt = amt_row[0] if amt_row else 0.0
 
-  cursor.execute(
-      "UPDATE withdrawals SET status='paid' WHERE id=?", (w_id,)
-  )
+  cur.execute("UPDATE withdrawals SET status='paid' WHERE id=?", (w_id,))
   conn.commit()
+  conn.close()
 
   try:
     await bot.send_message(
@@ -413,34 +469,55 @@ async def mark_payout_complete(call: types.CallbackQuery):
 # ======================= ACCOUNT SUBMISSION FLOW =======================
 @dp.message(F.text == "⚡ Submit Gmail Tasks")
 async def choose_submission_mode(message: types.Message):
+  rate_ready = get_rate("readymade")
+  rate_bot = get_rate("botdata")
+
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
           [
               InlineKeyboardButton(
-                  text="📋 Create From Bot Data", callback_data="mode_botdata"
+                  text=f"📋 Create From Bot Data (₹{rate_bot:.2f})",
+                  callback_data="mode_botdata",
               )
           ],
           [
               InlineKeyboardButton(
-                  text="📁 Submit Custom / Readymade",
+                  text=f"📁 Submit Readymade Account (₹{rate_ready:.2f})",
                   callback_data="mode_readymade",
               )
           ],
       ]
   )
-  await message.answer(
-      "Choose the submission path that fits your task:", reply_markup=kb
+  text = (
+      "⚡ <b>Select Account Submission Mode:</b>\n\n"
+      f"1️⃣ <b>Create From Bot Data:</b> Payout: <b>₹{rate_bot:.2f}</b> per"
+      " account.\n"
+      "• You must register using given First/Last Name, DOB, and credentials.\n\n"
+      f"2️⃣ <b>Readymade Account:</b> Payout: <b>₹{rate_ready:.2f}</b> per"
+      " account.\n"
+      "• Submit your own created Gmail accounts directly.\n\n"
+      "Choose which method you are submitting:"
   )
+  await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data == "mode_readymade")
 async def start_readymade_flow(call: types.CallbackQuery, state: FSMContext):
+  rate_ready = get_rate("readymade")
   await state.update_data(acc_type="Readymade")
-  await call.message.answer(
-      "📧 <b>Enter the Gmail Address:</b>\n<i>(e.g."
-      " <code>john.doe982@gmail.com</code>)</i>",
-      parse_mode="HTML",
+
+  msg = (
+      "📁 <b>Readymade Account Submission</b>\n"
+      "━━━━━━━━━━━━━━━━━━━━━━\n"
+      f"💰 <b>Reward:</b> ₹{rate_ready:.2f} per approved Gmail\n\n"
+      "⚠️ <b>Important Guidelines:</b>\n"
+      "• Account must be active and accessible.\n"
+      "• Do not submit suspended, disabled, or locked accounts.\n"
+      "• Always check credentials twice before submitting.\n\n"
+      "📧 <b>Please send your Gmail Address:</b>\n"
+      "<i>(Example: john.doe982@gmail.com)</i>"
   )
+  await call.message.answer(msg, parse_mode="HTML")
   await state.set_state(SubmitState.waiting_for_email)
   await call.answer()
 
@@ -448,14 +525,18 @@ async def start_readymade_flow(call: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "mode_botdata")
 async def start_botdata_flow(call: types.CallbackQuery, state: FSMContext):
   user_id = call.from_user.id
+  rate_bot = get_rate("botdata")
 
-  cursor.execute(
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
       "SELECT id, first_name, last_name, dob_month, dob_day, dob_year, email,"
       " password FROM task_stock WHERE status='available' LIMIT 1"
   )
-  item = cursor.fetchone()
+  item = cur.fetchone()
 
   if not item:
+    conn.close()
     await call.message.answer(
         "⚠️ <b>Task Data Out of Stock!</b>\n\nAll current task allocations are"
         " exhausted. Please wait while our team uploads a fresh batch.",
@@ -474,15 +555,17 @@ async def start_botdata_flow(call: types.CallbackQuery, state: FSMContext):
 
   stock_id, fn, ln, month, day, year, email, password = item
 
-  cursor.execute(
+  cur.execute(
       "UPDATE task_stock SET status='assigned', assigned_to=? WHERE id=?",
       (user_id, stock_id),
   )
   conn.commit()
+  conn.close()
 
   await state.update_data(acc_type="Bot-Data Task")
 
   task_msg = (
+      f"💰 <b>Reward:</b> ₹{rate_bot:.2f} per verified account\n\n"
       f"First name: {fn}\n"
       f"Last name: {ln}\n"
       "----------\n"
@@ -493,8 +576,8 @@ async def start_botdata_flow(call: types.CallbackQuery, state: FSMContext):
       "----------\n"
       f"Password: {password}\n"
       "----------\n"
-      "🔒 Be sure to use the specified data, otherwise the account will not be"
-      " paid.\n\n"
+      "🔒 <b>Notice:</b> Be sure to use the exact specified data, otherwise the"
+      " account will not be approved or paid.\n\n"
       "➡️ <b>Once created, send that Email Address here to proceed:</b>"
   )
   await call.message.answer(task_msg, parse_mode="HTML")
@@ -608,25 +691,33 @@ async def finalize_submission(msg_obj, user, state: FSMContext):
   rec = data["recovery"]
   two_fa = data["two_fa"]
 
-  cursor.execute(
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
       """
         INSERT INTO submissions (user_id, acc_type, email, password, recovery, two_fa, status)
         VALUES (?, ?, ?, ?, ?, ?, 'pending')
     """,
       (user.id, acc_type, email, pwd, rec, two_fa),
   )
-  sub_id = cursor.lastrowid
+  sub_id = cur.lastrowid
 
-  cursor.execute(
+  cur.execute(
       "UPDATE users SET total_submitted = total_submitted + 1 WHERE user_id=?",
       (user.id,),
   )
   conn.commit()
+  conn.close()
+
+  rate_preview = (
+      get_rate("botdata") if "Bot" in acc_type else get_rate("readymade")
+  )
 
   admin_kb = InlineKeyboardMarkup(
       inline_keyboard=[[
           InlineKeyboardButton(
-              text="✅ Approve", callback_data=f"adm_app_{sub_id}"
+              text=f"✅ Approve (+₹{rate_preview:.2f})",
+              callback_data=f"adm_app_{sub_id}",
           ),
           InlineKeyboardButton(
               text="❌ Reject", callback_data=f"adm_rej_{sub_id}"
@@ -639,7 +730,7 @@ async def finalize_submission(msg_obj, user, state: FSMContext):
       text=(
           f"📥 <b>New Submission #{sub_id}</b>\n"
           f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
-          f"🏷 Type: <b>{acc_type}</b>\n\n"
+          f"🏷 Type: <b>{acc_type}</b> (Rate: ₹{rate_preview:.2f})\n\n"
           f"📧 Email: <code>{email}</code>\n"
           f"🔑 Password: <code>{pwd}</code>\n"
           f"🛡 Recovery: <code>{rec}</code>\n"
@@ -663,41 +754,52 @@ async def finalize_submission(msg_obj, user, state: FSMContext):
 @dp.callback_query(F.data.startswith("adm_app_"))
 async def admin_approve_submission(call: types.CallbackQuery):
   sub_id = int(call.data.split("_")[2])
-  cursor.execute(
-      "SELECT user_id, email, status FROM submissions WHERE id=?", (sub_id,)
+
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
+      "SELECT user_id, email, status, acc_type FROM submissions WHERE id=?",
+      (sub_id,),
   )
-  row = cursor.fetchone()
+  row = cur.fetchone()
 
   if not row or str(row[2]).lower() != "pending":
+    conn.close()
     await call.answer("This task has already been processed.", show_alert=True)
     return
 
-  uid, mail, _ = row
-  rate = get_rate()
+  uid, mail, _, acc_type = row
+  reward = get_rate("botdata") if "Bot" in str(acc_type) else get_rate("readymade")
 
-  cursor.execute(
+  # Guaranteed disk balance update
+  cur.execute(
       "UPDATE submissions SET status='approved' WHERE id=?", (sub_id,)
   )
-  cursor.execute(
-      "UPDATE users SET balance = balance + ? WHERE user_id=?", (rate, uid)
+  cur.execute(
+      "UPDATE users SET balance = balance + ? WHERE user_id=?", (reward, uid)
   )
   conn.commit()
 
+  # Fetch new balance
+  cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
+  new_bal = cur.fetchone()[0]
+  conn.close()
+
   try:
     await bot.send_message(
-        chat_id=uid,
+        chat_id=int(uid),
         text=(
             f"🎉 <b>Account Approved!</b>\nYour account <code>{mail}</code>"
-            f" passed verification.\n<b>₹{rate:.2f}</b> has been credited to"
-            " your wallet!"
+            f" passed verification.\n<b>+₹{reward:.2f}</b> has been credited"
+            f" to your wallet!\n💵 Current Balance: <b>₹{new_bal:.2f}</b>"
         ),
         parse_mode="HTML",
     )
-  except:
-    pass
+  except Exception as e:
+    print(f"Error sending approve msg to {uid}: {e}")
 
   await call.message.edit_text(
-      f"{call.message.text}\n\n✅ <b>STATUS: APPROVED (+₹{rate:.2f})</b>",
+      f"{call.message.text}\n\n✅ <b>STATUS: APPROVED (+₹{reward:.2f})</b>",
       parse_mode="HTML",
   )
   await call.answer("Approved!")
@@ -707,8 +809,12 @@ async def admin_approve_submission(call: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("adm_rej_"))
 async def admin_reject_menu(call: types.CallbackQuery):
   sub_id = int(call.data.split("_")[2])
-  cursor.execute("SELECT status FROM submissions WHERE id=?", (sub_id,))
-  row = cursor.fetchone()
+
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT status FROM submissions WHERE id=?", (sub_id,))
+  row = cur.fetchone()
+  conn.close()
 
   if not row or str(row[0]).lower() != "pending":
     await call.answer("This task has already been processed.", show_alert=True)
@@ -751,42 +857,43 @@ async def admin_reject_menu(call: types.CallbackQuery):
   await call.answer()
 
 
-# Quick reason button execution
 @dp.callback_query(F.data.startswith("rk_"))
 async def admin_reject_quick(call: types.CallbackQuery):
   parts = call.data.split("_", 2)
   sub_id = int(parts[1])
   reason = parts[2]
 
-  cursor.execute(
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
       "SELECT user_id, email, status FROM submissions WHERE id=?", (sub_id,)
   )
-  row = cursor.fetchone()
+  row = cur.fetchone()
 
   if not row or str(row[2]).lower() != "pending":
+    conn.close()
     await call.answer("This task has already been processed.", show_alert=True)
     return
 
   uid, mail, _ = row
-  cursor.execute(
+  cur.execute(
       "UPDATE submissions SET status='rejected', rejection_reason=? WHERE"
       " id=?",
       (reason, sub_id),
   )
   conn.commit()
+  conn.close()
 
   try:
-    await bot.send_message(
-        chat_id=uid,
-        text=(
-            f"❌ <b>Submission Rejected</b>\nAccount: <code>{mail}</code>\n"
-            f"<b>Reason:</b> {reason}\n\n"
-            "You can check your submission logs inside 📊 My Submissions."
-        ),
-        parse_mode="HTML",
+    user_alert = (
+        f"❌ <b>Submission Rejected</b>\n\n"
+        f"Account: <code>{mail}</code>\n"
+        f"<b>Reason:</b> {reason}\n\n"
+        "You can check your status log inside 📊 My Submissions."
     )
-  except:
-    pass
+    await bot.send_message(chat_id=int(uid), text=user_alert, parse_mode="HTML")
+  except Exception as e:
+    print(f"Error sending reject alert to user {uid}: {e}")
 
   await call.message.edit_text(
       f"❌ <b>Submission #{sub_id} Rejected</b>\nReason: <b>{reason}</b>",
@@ -795,7 +902,6 @@ async def admin_reject_quick(call: types.CallbackQuery):
   await call.answer("Rejected!")
 
 
-# Custom typed reason
 @dp.callback_query(F.data.startswith("rcust_"))
 async def admin_reject_custom_start(
     call: types.CallbackQuery, state: FSMContext
@@ -820,14 +926,16 @@ async def admin_reject_custom_save(
   sub_id = data.get("target_sub_id")
   reason = message.text.strip()
 
-  cursor.execute(
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
       "SELECT user_id, email FROM submissions WHERE id=?", (sub_id,)
   )
-  row = cursor.fetchone()
+  row = cur.fetchone()
 
   if row:
     uid, mail = row
-    cursor.execute(
+    cur.execute(
         "UPDATE submissions SET status='rejected', rejection_reason=? WHERE"
         " id=?",
         (reason, sub_id),
@@ -835,18 +943,19 @@ async def admin_reject_custom_save(
     conn.commit()
 
     try:
-      await bot.send_message(
-          chat_id=uid,
-          text=(
-              f"❌ <b>Submission Rejected</b>\nAccount: <code>{mail}</code>\n"
-              f"<b>Reason:</b> {reason}\n\n"
-              "You can check your submission logs inside 📊 My Submissions."
-          ),
-          parse_mode="HTML",
+      user_alert = (
+          f"❌ <b>Submission Rejected</b>\n\n"
+          f"Account: <code>{mail}</code>\n"
+          f"<b>Reason:</b> {reason}\n\n"
+          "You can check your status log inside 📊 My Submissions."
       )
-    except:
-      pass
+      await bot.send_message(
+          chat_id=int(uid), text=user_alert, parse_mode="HTML"
+      )
+    except Exception as e:
+      print(f"Error sending reject alert to user {uid}: {e}")
 
+  conn.close()
   await message.answer(
       f"✅ Submission #{sub_id} rejected with reason: <b>{reason}</b>",
       parse_mode="HTML",
@@ -860,15 +969,20 @@ async def admin_control_panel(message: types.Message):
   if message.from_user.id != ADMIN_ID:
     return
 
-  cursor.execute("SELECT COUNT(*) FROM users")
-  total_users = cursor.fetchone()[0]
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT COUNT(*) FROM users")
+  total_users = cur.fetchone()[0]
 
-  cursor.execute(
+  cur.execute(
       "SELECT COUNT(*) FROM submissions WHERE LOWER(status)='pending'"
   )
-  pending_subs = cursor.fetchone()[0]
+  pending_subs = cur.fetchone()[0]
+  conn.close()
 
   available_stock = get_available_stock_count()
+  r_ready = get_rate("readymade")
+  r_bot = get_rate("botdata")
 
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -880,9 +994,13 @@ async def admin_control_panel(message: types.Message):
           ],
           [
               InlineKeyboardButton(
-                  text="⚙️ Update Rate Per Task",
-                  callback_data="adm_change_rate",
-              )
+                  text=f"⚙️ Readymade Rate (₹{r_ready:.2f})",
+                  callback_data="rate_change_readymade",
+              ),
+              InlineKeyboardButton(
+                  text=f"⚙️ Bot Data Rate (₹{r_bot:.2f})",
+                  callback_data="rate_change_botdata",
+              ),
           ],
           [
               InlineKeyboardButton(
@@ -897,8 +1015,10 @@ async def admin_control_panel(message: types.Message):
       "━━━━━━━━━━━━━━━━━━━━━━\n"
       f"👥 <b>Total Users:</b> {total_users}\n"
       f"📦 <b>Task Stock Ready:</b> {available_stock}\n"
-      f"⏳ <b>Pending Submissions:</b> {pending_subs}\n"
-      f"💰 <b>Current Rate:</b> ₹{get_rate():.2f}"
+      f"⏳ <b>Pending Submissions:</b> {pending_subs}\n\n"
+      "💰 <b>Rates:</b>\n"
+      f"• 📁 Readymade: ₹{r_ready:.2f}\n"
+      f"• 📋 Bot-Data: ₹{r_bot:.2f}"
   )
   await message.answer(dashboard, parse_mode="HTML", reply_markup=kb)
 
@@ -928,12 +1048,15 @@ async def adm_process_bulk_stock(message: types.Message, state: FSMContext):
     return
   lines = message.text.strip().split("\n")
   added = 0
+  conn = get_db()
+  cur = conn.cursor()
+
   for line in lines:
     parts = [p.strip() for p in line.split("|")]
     if len(parts) == 7:
       fn, ln, month, day, year, mail, pwd = parts
       try:
-        cursor.execute(
+        cur.execute(
             """
                     INSERT INTO task_stock (first_name, last_name, dob_month, dob_day, dob_year, email, password)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -943,7 +1066,9 @@ async def adm_process_bulk_stock(message: types.Message, state: FSMContext):
         added += 1
       except sqlite3.IntegrityError:
         pass
+
   conn.commit()
+  conn.close()
 
   await message.answer(
       f"✅ <b>Stock Uploaded:</b> Added <b>{added}</b> profiles.\n"
@@ -953,14 +1078,16 @@ async def adm_process_bulk_stock(message: types.Message, state: FSMContext):
   await state.clear()
 
 
-@dp.callback_query(F.data == "adm_change_rate")
-async def adm_change_rate_prompt(
-    call: types.CallbackQuery, state: FSMContext
-):
+@dp.callback_query(F.data.startswith("rate_change_"))
+async def adm_rate_change_prompt(call: types.CallbackQuery, state: FSMContext):
   if call.from_user.id != ADMIN_ID:
     return
+  rate_type = call.data.split("_")[2]  # readymade or botdata
+  label = "Readymade Accounts" if rate_type == "readymade" else "Bot-Data Tasks"
+  await state.update_data(target_rate_type=rate_type)
   await call.message.answer(
-      "Enter new payout rate per Gmail task (e.g. 15 or 20):"
+      f"⚙️ Enter new rate for <b>{label}</b> (e.g. 15 or 18.5):",
+      parse_mode="HTML",
   )
   await state.set_state(AdminState.waiting_for_new_rate)
   await call.answer()
@@ -970,11 +1097,18 @@ async def adm_change_rate_prompt(
 async def adm_process_new_rate(message: types.Message, state: FSMContext):
   if message.from_user.id != ADMIN_ID:
     return
+  data = await state.get_data()
+  rate_type = data.get("target_rate_type", "readymade")
+
   try:
     val = float(message.text.strip())
-    set_rate(val)
+    set_rate(rate_type, val)
+    label = (
+        "Readymade Accounts" if rate_type == "readymade" else "Bot-Data Tasks"
+    )
     await message.answer(
-        f"✅ Rate successfully updated to: <b>₹{val:.2f}</b>", parse_mode="HTML"
+        f"✅ Rate for <b>{label}</b> updated to: <b>₹{val:.2f}</b>",
+        parse_mode="HTML",
     )
   except ValueError:
     await message.answer("⚠️ Please enter a valid number.")
@@ -1009,10 +1143,13 @@ async def adm_process_addbal_amt(message: types.Message, state: FSMContext):
   uid = int(data["target_uid"])
   amt = float(message.text.strip())
 
-  cursor.execute(
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute(
       "UPDATE users SET balance = balance + ? WHERE user_id=?", (amt, uid)
   )
   conn.commit()
+  conn.close()
 
   await message.answer(
       f"✅ Balance adjusted for user <code>{uid}</code> by ₹{amt:.2f}.",
