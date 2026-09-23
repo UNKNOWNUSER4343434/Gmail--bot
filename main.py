@@ -140,7 +140,7 @@ class AdminState(StatesGroup):
   waiting_for_new_rate = State()
   waiting_for_addbal_id = State()
   waiting_for_addbal_amount = State()
-  waiting_for_reject_reason = State()
+  waiting_for_custom_reject = State()
 
 
 # ======================= KEYBOARDS =======================
@@ -253,7 +253,7 @@ async def submissions_status_page(message: types.Message):
     text += "<i>No submissions found yet.</i>\n"
   else:
     for s_mail, s_status, s_reason in recent_subs:
-      st = s_status.lower()
+      st = str(s_status).lower()
       if st == "approved":
         tag = "✅ Approved"
       elif st == "rejected":
@@ -292,7 +292,7 @@ async def wallet_dashboard(message: types.Message):
   else:
     for w_amt, w_upi, w_status in withdrawals:
       w_tag = (
-          "✅ Paid" if w_status.lower() == "paid" else "⏳ Pending Review"
+          "✅ Paid" if str(w_status).lower() == "paid" else "⏳ Pending Review"
       )
       text += f"• ₹{w_amt:.2f} via <code>{w_upi}</code> ➔ {w_tag}\n"
 
@@ -703,8 +703,9 @@ async def admin_approve_submission(call: types.CallbackQuery):
   await call.answer("Approved!")
 
 
+# --- REJECT MENU WITH INSTANT REASON BUTTONS ---
 @dp.callback_query(F.data.startswith("adm_rej_"))
-async def admin_reject_start(call: types.CallbackQuery, state: FSMContext):
+async def admin_reject_menu(call: types.CallbackQuery):
   sub_id = int(call.data.split("_")[2])
   cursor.execute("SELECT status FROM submissions WHERE id=?", (sub_id,))
   row = cursor.fetchone()
@@ -713,25 +714,110 @@ async def admin_reject_start(call: types.CallbackQuery, state: FSMContext):
     await call.answer("This task has already been processed.", show_alert=True)
     return
 
-  await state.update_data(target_sub_id=sub_id, original_msg_id=call.message.id)
-  await call.message.answer(
-      f"❌ <b>Enter rejection reason for submission #{sub_id}:</b>\n<i>(e.g."
-      " Wrong password / 2FA locked / Account disabled)</i>",
-      parse_mode="HTML",
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="❌ Wrong Password",
+                  callback_data=f"rk_{sub_id}_Wrong Password",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="🔒 2FA / OTP Locked",
+                  callback_data=f"rk_{sub_id}_2FA Locked",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="⚠️ Account Disabled",
+                  callback_data=f"rk_{sub_id}_Account Disabled",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="✏️ Custom Reason (Type)",
+                  callback_data=f"rcust_{sub_id}",
+              )
+          ],
+      ]
   )
-  await state.set_state(AdminState.waiting_for_reject_reason)
+
+  await call.message.reply(
+      f"❌ <b>Select Rejection Reason for #{sub_id}:</b>",
+      parse_mode="HTML",
+      reply_markup=kb,
+  )
   await call.answer()
 
 
-@dp.message(AdminState.waiting_for_reject_reason)
-async def admin_reject_save(message: types.Message, state: FSMContext):
+# Quick reason button execution
+@dp.callback_query(F.data.startswith("rk_"))
+async def admin_reject_quick(call: types.CallbackQuery):
+  parts = call.data.split("_", 2)
+  sub_id = int(parts[1])
+  reason = parts[2]
+
+  cursor.execute(
+      "SELECT user_id, email, status FROM submissions WHERE id=?", (sub_id,)
+  )
+  row = cursor.fetchone()
+
+  if not row or str(row[2]).lower() != "pending":
+    await call.answer("This task has already been processed.", show_alert=True)
+    return
+
+  uid, mail, _ = row
+  cursor.execute(
+      "UPDATE submissions SET status='rejected', rejection_reason=? WHERE"
+      " id=?",
+      (reason, sub_id),
+  )
+  conn.commit()
+
+  try:
+    await bot.send_message(
+        chat_id=uid,
+        text=(
+            f"❌ <b>Submission Rejected</b>\nAccount: <code>{mail}</code>\n"
+            f"<b>Reason:</b> {reason}\n\n"
+            "You can check your submission logs inside 📊 My Submissions."
+        ),
+        parse_mode="HTML",
+    )
+  except:
+    pass
+
+  await call.message.edit_text(
+      f"❌ <b>Submission #{sub_id} Rejected</b>\nReason: <b>{reason}</b>",
+      parse_mode="HTML",
+  )
+  await call.answer("Rejected!")
+
+
+# Custom typed reason
+@dp.callback_query(F.data.startswith("rcust_"))
+async def admin_reject_custom_start(
+    call: types.CallbackQuery, state: FSMContext
+):
+  sub_id = int(call.data.split("_")[1])
+  await state.update_data(target_sub_id=sub_id)
+  await call.message.answer(
+      f"✏️ <b>Type custom rejection reason for #{sub_id} below:</b>",
+      parse_mode="HTML",
+  )
+  await state.set_state(AdminState.waiting_for_custom_reject)
+  await call.answer()
+
+
+@dp.message(AdminState.waiting_for_custom_reject)
+async def admin_reject_custom_save(
+    message: types.Message, state: FSMContext
+):
   if message.from_user.id != ADMIN_ID:
     return
   data = await state.get_data()
   sub_id = data.get("target_sub_id")
-  if not sub_id:
-    return
-
   reason = message.text.strip()
 
   cursor.execute(
