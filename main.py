@@ -99,7 +99,6 @@ async def init_db():
             );
         """)
 
-        # Auto-migration columns check
         await conn.execute("""
             ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL;
             ALTER TABLE submissions ADD COLUMN IF NOT EXISTS is_old TEXT DEFAULT 'No';
@@ -109,13 +108,12 @@ async def init_db():
             ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS created_at TEXT;
         """)
 
-        # Default Settings
         await conn.execute("""
             INSERT INTO settings (key, value) VALUES ('rate_readymade', '12.0') ON CONFLICT (key) DO NOTHING;
             INSERT INTO settings (key, value) VALUES ('rate_botdata', '15.0') ON CONFLICT (key) DO NOTHING;
             INSERT INTO settings (key, value) VALUES ('ref_bonus', '1.0') ON CONFLICT (key) DO NOTHING;
         """)
-    print("Database ready!")
+    print("Database connection and tables ready!")
 
 async def get_setting(key: str, default: float = 15.0):
     async with db_pool.acquire() as conn:
@@ -146,14 +144,14 @@ async def ensure_user(user_id: int, username: str = "", referrer_id: int = None)
         else:
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2", username, user_id)
 
-# ======================= KEYBOARDS =======================
+# ======================= KEYBOARDS IN ENGLISH =======================
 def kb_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Register a new Gmail")],
-            [KeyboardButton(text="📁 My Accounts"), KeyboardButton(text="💼 My Wallet")],
-            [KeyboardButton(text="👥 My Referrals"), KeyboardButton(text="⚙️ Settings")],
-            [KeyboardButton(text="💬 Help")]
+            [KeyboardButton(text="⚡ Submit Gmail Account")],
+            [KeyboardButton(text="📊 My Submissions"), KeyboardButton(text="💼 My Wallet")],
+            [KeyboardButton(text="👥 Refer & Earn"), KeyboardButton(text="📦 Task Stock")],
+            [KeyboardButton(text="📢 Official Channel"), KeyboardButton(text="💬 24/7 Support")]
         ],
         resize_keyboard=True
     )
@@ -161,32 +159,32 @@ def kb_main_menu():
 def kb_sub_mode():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✍️ Submit my own"), KeyboardButton(text="📋 Generate new task")],
-            [KeyboardButton(text="🚫 Cancel registration")]
+            [KeyboardButton(text="📁 Readymade Gmail"), KeyboardButton(text="⚡ Bot Task Account")],
+            [KeyboardButton(text="❌ Cancel")]
         ],
         resize_keyboard=True
     )
 
 def kb_cancel():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🚫 Cancel registration")]],
+        keyboard=[[KeyboardButton(text="❌ Cancel")]],
         resize_keyboard=True
     )
 
 def kb_recovery():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⏩ Skip recovery email")],
-            [KeyboardButton(text="🚫 Cancel registration")]
+            [KeyboardButton(text="⏭ Skip Recovery Email")],
+            [KeyboardButton(text="❌ Cancel")]
         ],
         resize_keyboard=True
     )
 
-def kb_age_check():
+def kb_account_age():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✅ Yes"), KeyboardButton(text="❌ No / Fresh")],
-            [KeyboardButton(text="🚫 Cancel registration")]
+            [KeyboardButton(text="📆 Older than 30 Days"), KeyboardButton(text="🆕 Fresh Account")],
+            [KeyboardButton(text="❌ Cancel")]
         ],
         resize_keyboard=True
     )
@@ -194,14 +192,14 @@ def kb_age_check():
 def kb_2fa():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔐 Add 2FA key")],
-            [KeyboardButton(text="✓ Done (without 2FA)")],
-            [KeyboardButton(text="🚫 Cancel registration")]
+            [KeyboardButton(text="🔐 Add 2FA Secret Key (Faster Payout)")],
+            [KeyboardButton(text="⚡ Submit Without 2FA")],
+            [KeyboardButton(text="❌ Cancel")]
         ],
         resize_keyboard=True
     )
 
-# ======================= STATES =======================
+# ======================= FSM STATES =======================
 class SubmitState(StatesGroup):
     choosing_mode = State()
     waiting_for_email = State()
@@ -223,13 +221,13 @@ class AdminState(StatesGroup):
     waiting_for_custom_reject = State()
     waiting_for_utr = State()
 
-# ======================= CANCEL HANDLER =======================
-@dp.message(F.text == "🚫 Cancel registration")
-async def cancel_registration_handler(message: types.Message, state: FSMContext):
+# ======================= CANCEL ACTION =======================
+@dp.message(F.text == "❌ Cancel")
+async def cancel_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("🔄 Registration cancelled. Main dashboard ready.", reply_markup=kb_main_menu())
+    await message.answer("🔄 Operation cancelled. Returning to main menu:", reply_markup=kb_main_menu())
 
-# ======================= START & BASIC =======================
+# ======================= START & DASHBOARD =======================
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
@@ -246,38 +244,48 @@ async def start_handler(message: types.Message, state: FSMContext):
     msg = (
         f"👋 <b>Welcome, {html.escape(message.from_user.first_name)}!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Earn real money by creating and delivering verified Gmail accounts.\n\n"
+        "Earn instant money by providing verified Google accounts.\n\n"
         "💰 <b>Current Rates:</b>\n"
-        f"• 📋 <b>Bot Tasks:</b> ₹{r_bot:.2f} / account\n"
-        f"• 📁 <b>Readymade Accounts:</b> ₹{r_ready:.2f} / account\n\n"
-        "⏱ <b>Audit Window:</b> 24 - 72 Hours max\n"
-        "Tap the buttons below to begin:"
+        f"• ⚡ <b>Bot Task Creation:</b> ₹{r_bot:.2f} per account\n"
+        f"• 📁 <b>Readymade Gmail :</b> ₹{r_ready:.2f} per account\n\n"
+        "⏱ <b>Audit Window:</b> 24 to 48 Hours\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select an option below to start:"
     )
     await message.answer(msg, parse_mode="HTML", reply_markup=kb_main_menu())
 
-@dp.message(F.text == "💬 Help")
-async def help_handler(message: types.Message):
+@dp.message(F.text == "💬 24/7 Support")
+async def support_handler(message: types.Message):
     await message.answer(
-        f"💬 <b>Support & Assistance:</b>\n"
-        f"• Channel: {CHANNEL_LINK}\n"
-        f"• 24/7 Support Admin: {SUPPORT_USER}\n\n"
-        "Feel free to drop a message if you encounter issues.",
+        f"💬 <b>Direct Support:</b>\n"
+        f"• Support Manager: {SUPPORT_USER}\n"
+        f"• Community Updates: {CHANNEL_LINK}\n\n"
+        "Reach out directly for any account or payout inquiries.",
         parse_mode="HTML"
     )
 
-@dp.message(F.text == "⚙️ Settings")
-async def settings_handler(message: types.Message):
-    uid = message.from_user.id
+@dp.message(F.text == "📢 Official Channel")
+async def channel_handler(message: types.Message):
     await message.answer(
-        f"⚙️ <b>Account Profile:</b>\n"
-        f"• User ID: <code>{uid}</code>\n"
-        f"• Username: @{message.from_user.username or 'N/A'}\n"
-        f"• Network: GmailArena Production Server",
+        f"📢 <b>Official Telegram Channel:</b>\n{CHANNEL_LINK}\n\nFollow us for real-time payment proofs and price changes.",
         parse_mode="HTML"
     )
 
-@dp.message(F.text == "👥 My Referrals")
-async def referrals_handler(message: types.Message):
+@dp.message(F.text == "📦 Task Stock")
+async def task_stock_handler(message: types.Message):
+    slots = await get_available_stock_count()
+    r_bot = await get_setting("rate_botdata", 15.0)
+    await message.answer(
+        f"📦 <b>Bot Task Allocations:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <b>Available Task Slots:</b> <b>{slots}</b> accounts ready\n"
+        f"💵 <b>Current Rate:</b> ₹{r_bot:.2f} per verified account\n\n"
+        "<i>Tap '⚡ Submit Gmail Account' and choose Bot Task to claim your credentials.</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "👥 Refer & Earn")
+async def refer_handler(message: types.Message):
     uid = message.from_user.id
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start={uid}"
@@ -287,12 +295,12 @@ async def referrals_handler(message: types.Message):
         count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referred_by=$1", uid)
 
     text = (
-        "👥 <b>Affiliate Network Program</b>\n"
+        "👥 <b>Affiliate Program</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Share your referral link with creators and suppliers to earn passive payouts.\n\n"
-        f"• Total Direct Invites: <b>{count or 0}</b>\n"
+        "Invite your friends and suppliers to earn passive commission!\n\n"
+        f"• Total Referrals: <b>{count or 0}</b> users\n"
         f"• Commission: <b>₹{bonus:.2f}</b> on every approved account\n\n"
-        "🔗 <b>Your Exclusive Link:</b>\n"
+        "🔗 <b>Your Invite Link:</b>\n"
         f"<code>{link}</code>"
     )
     await message.answer(text, parse_mode="HTML")
@@ -312,16 +320,16 @@ async def wallet_handler(message: types.Message):
     min_p = min(r1, r2)
 
     text = (
-        "💼 <b>My Financial Wallet</b>\n"
+        "💼 <b>Financial Wallet Dashboard</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Available Balance:</b> <b>₹{balance:.2f}</b>\n"
-        f"💳 <b>Minimum Cashout:</b> ₹{min_p:.2f}\n"
+        f"💳 <b>Minimum Withdrawal:</b> ₹{min_p:.2f}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Direct UPI Bank Transfer with instant UTR confirmation."
+        "Direct UPI Bank Transfer with instant UTR proof."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Request Cashout", callback_data="claim_funds")],
-        [InlineKeyboardButton(text="📜 View Payout History", callback_data="view_payout_history")]
+        [InlineKeyboardButton(text="💸 Request Withdrawal (UPI)", callback_data="claim_funds")],
+        [InlineKeyboardButton(text="📜 Payout History", callback_data="view_payout_history")]
     ])
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -334,19 +342,19 @@ async def payout_history_call(call: types.CallbackQuery):
             FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 8
         """, uid)
 
-    text = "📜 <b>Payout Transaction Invoices:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text = "📜 <b>Withdrawal Transaction Invoices:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     if not payouts:
-        text += "<i>No payout requests found yet.</i>\n"
+        text += "<i>No withdrawal requests placed yet.</i>\n"
     else:
         for p in payouts:
             st = str(p['status']).lower()
             badge = "🟢 PAID" if st == "paid" else "⏳ PENDING"
-            text += f"<b>Order:</b> <code>{p['order_id']}</code>\n"
-            text += f"💵 Amount: <b>₹{float(p['amount']):.2f}</b> | {badge}\n"
+            text += f"<b>Order ID:</b> <code>{p['order_id']}</code>\n"
+            text += f"💵 Amount: <b>₹{float(p['amount']):.2f}</b> | Status: {badge}\n"
             text += f"📱 UPI: <code>{html.escape(p['upi_id'])}</code>\n"
             text += f"📅 Date: {p['created_at'] or 'Recent'}\n"
             if p['utr']:
-                text += f"🧾 UTR / Ref: <code>{html.escape(p['utr'])}</code>\n"
+                text += f"🧾 Bank UTR: <code>{html.escape(p['utr'])}</code>\n"
             text += "────────────────────────\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -366,16 +374,16 @@ async def back_to_wallet_call(call: types.CallbackQuery):
     min_p = min(r1, r2)
 
     text = (
-        "💼 <b>My Financial Wallet</b>\n"
+        "💼 <b>Financial Wallet Dashboard</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Available Balance:</b> <b>₹{balance:.2f}</b>\n"
-        f"💳 <b>Minimum Cashout:</b> ₹{min_p:.2f}\n"
+        f"💳 <b>Minimum Withdrawal:</b> ₹{min_p:.2f}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Direct UPI Bank Transfer with instant UTR confirmation."
+        "Direct UPI Bank Transfer with instant UTR proof."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Request Cashout", callback_data="claim_funds")],
-        [InlineKeyboardButton(text="📜 View Payout History", callback_data="view_payout_history")]
+        [InlineKeyboardButton(text="💸 Request Withdrawal (UPI)", callback_data="claim_funds")],
+        [InlineKeyboardButton(text="📜 Payout History", callback_data="view_payout_history")]
     ])
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
@@ -391,13 +399,13 @@ async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
     min_p = min(r1, r2)
 
     if balance < min_p:
-        await call.answer(f"Minimum threshold is ₹{min_p:.2f}. Balance is ₹{balance:.2f}.", show_alert=True)
+        await call.answer(f"Minimum threshold is ₹{min_p:.2f}. Your balance is ₹{balance:.2f}.", show_alert=True)
         return
 
     await call.message.answer(
-        "📱 <b>Enter your Official UPI ID for transfer:</b>\n"
-        "<i>Valid Handles: @okaxis, @paytm, @ybl, @oksbi, @okhdfcbank, etc.</i>\n\n"
-        "Example: <code>rajesh98@okaxis</code>",
+        "📱 <b>Please enter your UPI ID for settlement:</b>\n"
+        "<i>Valid Handles: @okaxis, @paytm, @ybl, @oksbi, @okhdfcbank, @fam, etc.</i>\n\n"
+        "Example: <code>9876543210@paytm</code> or <code>username@okaxis</code>",
         parse_mode="HTML",
         reply_markup=kb_cancel()
     )
@@ -411,14 +419,15 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
     if not UPI_REGEX.match(upi) or " " in upi:
         await message.answer(
             "⚠️ <b>Invalid UPI Address!</b>\n"
-            "Must be a valid handle like <code>@okaxis</code>, <code>@paytm</code>, <code>@ybl</code>, <code>@oksbi</code>.\n\n"
-            "Try again or tap <b>🚫 Cancel registration</b>:",
+            "Please provide a valid address with handles like <code>@okaxis</code>, <code>@paytm</code>, <code>@ybl</code>, <code>@oksbi</code>.\n\n"
+            "Try again or press <b>❌ Cancel</b>:",
             parse_mode="HTML"
         )
         return
 
     uid = message.from_user.id
-    order_id = f"GA-W-{random.randint(10000, 99999)}"
+    # Auto-generate unique order ID
+    order_id = f"GMA-W-{random.randint(10000, 99999)}"
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     async with db_pool.acquire() as conn:
@@ -437,31 +446,32 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
         """, order_id, uid, balance, upi, now_str)
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💸 Mark Paid & Enter UTR", callback_data=f"startpay_{w_id}")
+        InlineKeyboardButton(text="💸 Mark Paid & Assign UTR", callback_data=f"startpay_{w_id}")
     ]])
 
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            f"🔔 <b>New Cashout Order: {order_id}</b>\n"
+            f"🔔 <b>New Withdrawal Request: {order_id}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 User: @{message.from_user.username} (ID: <code>{uid}</code>)\n"
             f"💵 Amount: <b>₹{balance:.2f}</b>\n"
-            f"📱 UPI: <code>{html.escape(upi)}</code>\n"
-            f"📅 Date: {now_str}"
+            f"📱 UPI Target: <code>{html.escape(upi)}</code>\n"
+            f"📅 Placed: {now_str}"
         ),
         parse_mode="HTML",
         reply_markup=admin_kb
     )
 
     await message.answer(
-        f"✅ <b>Order #{order_id} Placed!</b>\n"
+        f"✅ <b>Withdrawal Order #{order_id} Registered!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧾 Order ID     : <code>{order_id}</code>\n"
         f"💵 Payout Amount : <b>₹{balance:.2f}</b>\n"
-        f"📱 UPI Target    : <code>{html.escape(upi)}</code>\n"
+        f"📱 Target UPI    : <code>{html.escape(upi)}</code>\n"
         "⏳ Status        : <b>Processing Settlement</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Track inside <b>💼 My Wallet ➔ View Payout History</b>.",
+        "You can track this transaction in <b>💼 My Wallet ➔ Payout History</b>.",
         parse_mode="HTML",
         reply_markup=kb_main_menu()
     )
@@ -477,14 +487,14 @@ async def admin_pay_request_utr(call: types.CallbackQuery, state: FSMContext):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT order_id, amount, upi_id, status FROM withdrawals WHERE id=$1", w_id)
         if not row or row['status'] != 'pending':
-            await call.answer("This withdrawal is already settled!", show_alert=True)
+            await call.answer("This withdrawal is already processed!", show_alert=True)
             return
 
     await state.update_data(target_wid=w_id)
     await call.message.reply(
-        f"🧾 <b>Enter the UTR / Ref Number for #{row['order_id']}:</b>\n"
+        f"🧾 <b>Enter the UTR / Bank Reference Number for Order #{row['order_id']}:</b>\n"
         f"Amount: ₹{float(row['amount']):.2f} | UPI: <code>{row['upi_id']}</code>\n\n"
-        "Send the 12-digit UTR below:",
+        "Type the reference number below:",
         parse_mode="HTML"
     )
     await state.set_state(AdminState.waiting_for_utr)
@@ -511,25 +521,25 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
                 await bot.send_message(
                     chat_id=uid,
                     text=(
-                        f"🎉 <b>Settlement Dispatched!</b>\n"
+                        f"🎉 <b>Withdrawal Completed & Dispatched!</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🧾 Order ID   : <b>{order_id}</b>\n"
-                        f"💵 Transferred: <b>₹{amount:.2f}</b>\n"
-                        f"📱 UPI Target : <code>{html.escape(upi)}</code>\n"
-                        f"🔗 UTR/Ref No : <code>{html.escape(utr_code)}</code>\n"
+                        f"💵 Amount     : <b>₹{amount:.2f}</b>\n"
+                        f"📱 Target UPI : <code>{html.escape(upi)}</code>\n"
+                        f"🔗 Bank UTR   : <code>{html.escape(utr_code)}</code>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "Funds should reflect in your bank account."
+                        "Funds have been transferred to your bank account."
                     ),
                     parse_mode="HTML"
                 )
             except Exception as e:
-                print(f"Error sending notification: {e}")
+                print(f"Error notifying: {e}")
 
-    await message.answer(f"✅ Order <b>{order_id}</b> paid with UTR: <code>{utr_code}</code>", parse_mode="HTML")
+    await message.answer(f"✅ Order <b>{order_id}</b> settled with UTR: <code>{utr_code}</code>", parse_mode="HTML")
     await state.clear()
 
-# ======================= MY SUBMISSIONS (ACCOUNTS) =======================
-async def get_accounts_card(uid: int):
+# ======================= MY SUBMISSIONS DASHBOARD =======================
+async def get_submissions_card(uid: int):
     async with db_pool.acquire() as conn:
         total = await conn.fetchval("SELECT COUNT(*) FROM submissions WHERE user_id=$1", uid)
         pending = await conn.fetchval("SELECT COUNT(*) FROM submissions WHERE user_id=$1 AND LOWER(status)='pending'", uid)
@@ -542,12 +552,12 @@ async def get_accounts_card(uid: int):
         """, uid)
 
     card = (
-        "📁 <b>Account Submissions Console</b>\n"
+        "📊 <b>Your Account Submissions</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 Total Submitted : <b>{total or 0}</b>\n"
-        f"⏳ In Audit Queue  : <b>{pending or 0}</b>\n"
+        f"⏳ Under Review    : <b>{pending or 0}</b>\n"
         f"🟢 Approved        : <b>{approved or 0}</b>\n"
-        f"🔴 Disqualified    : <b>{rejected or 0}</b>\n"
+        f"🔴 Rejected        : <b>{rejected or 0}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b>Recent Submissions (Last 10):</b>\n\n"
     )
@@ -564,9 +574,9 @@ async def get_accounts_card(uid: int):
             card += f"📅 Submitted: <code>{time_str}</code>\n"
 
             if st == "approved":
-                card += "🟢 Status: <b>✅ Verified & Paid</b>\n"
+                card += "🟢 Status: <b>✅ Verified & Credited</b>\n"
             elif st == "rejected":
-                card += f"🔴 Status: <b>Disqualified</b>\n"
+                card += f"🔴 Status: <b>Rejected</b>\n"
                 card += f"⚠️ Reason: <i>{html.escape(row['rejection_reason'] or 'Credentials Failed')}</i>\n"
                 card += f"🔑 Pass: <code>{html.escape(row['password'])}</code> | Rec: <code>{html.escape(row['recovery'])}</code>\n"
                 if row['two_fa'] != 'None':
@@ -580,53 +590,60 @@ async def get_accounts_card(uid: int):
             card += "────────────────────────\n"
 
     refresh_btn = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Refresh Submissions", callback_data="reload_history")
+        InlineKeyboardButton(text="🔄 Refresh Status", callback_data="reload_history")
     ]])
     return card, refresh_btn
 
-@dp.message(F.text == "📁 My Accounts")
-async def accounts_view(message: types.Message):
-    card, kb = await get_accounts_card(message.from_user.id)
+@dp.message(F.text == "📊 My Submissions")
+async def submissions_view(message: types.Message):
+    card, kb = await get_submissions_card(message.from_user.id)
     await message.answer(card, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "reload_history")
-async def accounts_reload(call: types.CallbackQuery):
-    card, kb = await get_accounts_card(call.from_user.id)
+async def submissions_reload(call: types.CallbackQuery):
+    card, kb = await get_submissions_card(call.from_user.id)
     try:
         await call.message.edit_text(card, parse_mode="HTML", reply_markup=kb)
-        await call.answer("Refreshed!")
+        await call.answer("Status refreshed!")
     except Exception:
         await call.answer("Already up to date.")
 
-# ======================= ACCOUNT SUBMISSION FLOW =======================
-@dp.message(F.text == "➕ Register a new Gmail")
-async def sub_start_mode(message: types.Message, state: FSMContext):
+# ======================= ACCOUNT SUBMISSION WORKFLOW =======================
+@dp.message(F.text == "⚡ Submit Gmail Account")
+async def submit_start_mode(message: types.Message, state: FSMContext):
     r_ready = await get_setting("rate_readymade", 12.0)
     r_bot = await get_setting("rate_botdata", 15.0)
 
     text = (
-        "💰 <b>Earn with every approved account:</b>\n"
-        "• If account is older than 1 month, additional bonuses apply.\n"
-        "• Using bot data tasks gives top tier payout.\n\n"
-        f"1️⃣ <b>✍️ Submit my own:</b> ₹{r_ready:.2f} per account\n"
-        f"2️⃣ <b>📋 Generate new task:</b> ₹{r_bot:.2f} per account\n\n"
-        "Do you want us to generate login details or do you have an account?"
+        "⚡ <b>Select Account Submission Mode:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"1️⃣ <b>📁 Readymade Gmail:</b> <b>₹{r_ready:.2f}</b> per account\n"
+        "• Submit pre-created active Gmail accounts.\n"
+        "• Accounts must be clean, active, and accessible.\n\n"
+        f"2️⃣ <b>⚡ Bot Task Account:</b> <b>₹{r_bot:.2f}</b> per account\n"
+        "• We provide specific Name, DOB, and Password.\n"
+        "• Register the Gmail using exact bot credentials.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Choose an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=kb_sub_mode())
     await state.set_state(SubmitState.choosing_mode)
 
-@dp.message(SubmitState.choosing_mode, F.text == "✍️ Submit my own")
-async def sub_mode_ready(message: types.Message, state: FSMContext):
+@dp.message(SubmitState.choosing_mode, F.text == "📁 Readymade Gmail")
+async def submit_premade_mode(message: types.Message, state: FSMContext):
+    r_ready = await get_setting("rate_readymade", 12.0)
     await state.update_data(acc_type="Readymade")
     await message.answer(
-        "📧 <b>Please enter your Gmail address:</b>\n<i>(e.g. <code>username@gmail.com</code>)</i>",
+        f"📁 <b>Readymade Account Submission (Rate: ₹{r_ready:.2f})</b>\n\n"
+        "📧 <b>Please enter your Gmail address:</b>\n"
+        "<i>(e.g. <code>username123@gmail.com</code>)</i>",
         parse_mode="HTML",
         reply_markup=kb_cancel()
     )
     await state.set_state(SubmitState.waiting_for_email)
 
-@dp.message(SubmitState.choosing_mode, F.text == "📋 Generate new task")
-async def sub_mode_task(message: types.Message, state: FSMContext):
+@dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
+async def submit_task_mode(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     r_bot = await get_setting("rate_botdata", 15.0)
 
@@ -637,7 +654,7 @@ async def sub_mode_task(message: types.Message, state: FSMContext):
         """)
         if not row:
             await message.answer(
-                "⚠️ <b>Out of Task Slots!</b>\nAll bot-data tasks are currently claimed. Please use '✍️ Submit my own'.",
+                "⚠️ <b>Task Stock Empty!</b>\nAll bot-data tasks are currently claimed. Please use 'Readymade Gmail' or wait for restock.",
                 reply_markup=kb_main_menu()
             )
             await state.clear()
@@ -648,91 +665,88 @@ async def sub_mode_task(message: types.Message, state: FSMContext):
 
     await state.update_data(acc_type="Bot-Data Task")
     task_card = (
-        f"💰 <b>Task Allocated (Reward: ₹{r_bot:.2f}):</b>\n"
+        f"⚡ <b>Target Registration Credentials (Reward: ₹{r_bot:.2f}):</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"First name: <code>{html.escape(row['first_name'])}</code>\n"
-        f"Last name: <code>{html.escape(row['last_name'])}</code>\n"
-        "----------\n"
-        "Date of birth\n"
-        f"Month: <code>{html.escape(row['dob_month'])}</code> | Day: <code>{html.escape(str(row['dob_day']))}</code> | Year: <code>{html.escape(str(row['dob_year']))}</code>\n"
-        "----------\n"
-        f"Email: <code>{html.escape(row['email'])}</code>\n"
-        "----------\n"
-        f"Password: <code>{html.escape(row['password'])}</code>\n"
+        f"• First Name   : <code>{html.escape(row['first_name'])}</code>\n"
+        f"• Last Name    : <code>{html.escape(row['last_name'])}</code>\n"
+        f"• Date of Birth: <code>{html.escape(row['dob_month'])} {html.escape(str(row['dob_day']))}, {html.escape(str(row['dob_year']))}</code>\n"
+        f"• Suggested Mail: <code>{html.escape(row['email'])}</code>\n"
+        f"• Password     : <code>{html.escape(row['password'])}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔒 <b>Notice:</b> Create the Gmail using exact data above.\n\n"
+        "⚠️ <b>Strict Requirement:</b> Use the exact credentials above, otherwise payment will be rejected.\n\n"
         "➡️ <b>Once created, enter the registered Email Address below:</b>"
     )
     await message.answer(task_card, parse_mode="HTML", reply_markup=kb_cancel())
     await state.set_state(SubmitState.waiting_for_email)
 
 @dp.message(SubmitState.waiting_for_email)
-async def sub_get_email(message: types.Message, state: FSMContext):
+async def submit_get_email(message: types.Message, state: FSMContext):
     email = message.text.strip()
     if "@gmail.com" not in email.lower():
         await message.answer("⚠️ <b>Invalid Email:</b> Must end with <code>@gmail.com</code>. Try again:", parse_mode="HTML")
         return
     await state.update_data(email=email)
-    await message.answer("🔑 <b>Please enter your password:</b>", parse_mode="HTML", reply_markup=kb_cancel())
+    await message.answer("🔑 <b>Please enter the Password for this account:</b>", parse_mode="HTML", reply_markup=kb_cancel())
     await state.set_state(SubmitState.waiting_for_password)
 
 @dp.message(SubmitState.waiting_for_password)
-async def sub_get_password(message: types.Message, state: FSMContext):
+async def submit_get_password(message: types.Message, state: FSMContext):
     await state.update_data(password=message.text.strip())
     await message.answer(
-        "📧 <b>Please enter your recovery email address, or tap Skip — it is optional:</b>",
+        "🛡 <b>Recovery Email Check:</b>\nIf linked, send the recovery address below or tap <b>Skip</b>.",
         parse_mode="HTML",
         reply_markup=kb_recovery()
     )
     await state.set_state(SubmitState.waiting_for_recovery)
 
-@dp.message(SubmitState.waiting_for_recovery, F.text == "⏩ Skip recovery email")
-async def sub_skip_recovery(message: types.Message, state: FSMContext):
+@dp.message(SubmitState.waiting_for_recovery, F.text == "⏭ Skip Recovery Email")
+async def submit_skip_recovery(message: types.Message, state: FSMContext):
     await state.update_data(recovery="None")
     await ask_account_age(message, state)
 
 @dp.message(SubmitState.waiting_for_recovery)
-async def sub_input_recovery(message: types.Message, state: FSMContext):
+async def submit_input_recovery(message: types.Message, state: FSMContext):
     await state.update_data(recovery=message.text.strip())
     await ask_account_age(message, state)
 
 async def ask_account_age(message: types.Message, state: FSMContext):
     await message.answer(
-        "📅 <b>Is this account older than one month?</b>",
+        "📆 <b>Is this account older than 30 days?</b>",
         parse_mode="HTML",
-        reply_markup=kb_age_check()
+        reply_markup=kb_account_age()
     )
     await state.set_state(SubmitState.waiting_for_age)
 
-@dp.message(SubmitState.waiting_for_age, F.text.in_({"✅ Yes", "❌ No / Fresh"}))
-async def sub_get_age(message: types.Message, state: FSMContext):
-    is_old = "Yes" if "Yes" in message.text else "No"
+@dp.message(SubmitState.waiting_for_age, F.text.in_({"📆 Older than 30 Days", "🆕 Fresh Account"}))
+async def submit_get_age(message: types.Message, state: FSMContext):
+    is_old = "Yes" if "Older" in message.text else "No"
     await state.update_data(is_old=is_old)
 
     await message.answer(
-        "🔐 <b>We suggest you to set 2FA on the account to increase speed of audit on our side.</b>\n\n"
-        "You can submit your account with or without 2FA authentication key.",
+        "🔐 <b>Two-Factor Authentication (2FA):</b>\n"
+        "Setting up 2FA secret keys speeds up verification queue significantly.\n\n"
+        "You can submit with or without 2FA key:",
         parse_mode="HTML",
         reply_markup=kb_2fa()
     )
     await state.set_state(SubmitState.waiting_for_2fa_choice)
 
-@dp.message(SubmitState.waiting_for_2fa_choice, F.text == "✓ Done (without 2FA)")
-async def sub_finish_no_2fa(message: types.Message, state: FSMContext):
+@dp.message(SubmitState.waiting_for_2fa_choice, F.text == "⚡ Submit Without 2FA")
+async def submit_finish_no_2fa(message: types.Message, state: FSMContext):
     await state.update_data(two_fa="None")
-    await finalize_and_save_sub(message, state)
+    await finalize_submission(message, state)
 
-@dp.message(SubmitState.waiting_for_2fa_choice, F.text == "🔐 Add 2FA key")
-async def sub_req_2fa(message: types.Message, state: FSMContext):
+@dp.message(SubmitState.waiting_for_2fa_choice, F.text == "🔐 Add 2FA Secret Key (Faster Payout)")
+async def submit_req_2fa(message: types.Message, state: FSMContext):
     await message.answer("🔑 <b>Paste your 2FA Secret Key / Backup Code below:</b>", parse_mode="HTML", reply_markup=kb_cancel())
     await state.set_state(SubmitState.waiting_for_2fa_key)
 
 @dp.message(SubmitState.waiting_for_2fa_key)
-async def sub_finish_with_2fa(message: types.Message, state: FSMContext):
+async def submit_finish_with_2fa(message: types.Message, state: FSMContext):
     await state.update_data(two_fa=message.text.strip())
-    await finalize_and_save_sub(message, state)
+    await finalize_submission(message, state)
 
-async def finalize_and_save_sub(message: types.Message, state: FSMContext):
+async def finalize_submission(message: types.Message, state: FSMContext):
     data = await state.get_data()
     acc_type = data["acc_type"]
     email = data["email"]
@@ -756,21 +770,21 @@ async def finalize_and_save_sub(message: types.Message, state: FSMContext):
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{sub_id}"),
-        InlineKeyboardButton(text="❌ Reject Task", callback_data=f"adm_rejmenu_{sub_id}")
+        InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{sub_id}")
     ]])
 
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            f"📥 <b>Submission Queue Item #{sub_id}</b>\n"
+            f"📥 <b>New Submission #{sub_id}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
             f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n"
-            f"📅 1+ Month Old: <b>{is_old}</b>\n\n"
-            f"📧 Email: <code>{html.escape(email)}</code>\n"
-            f"🔑 Password: <code>{html.escape(pwd)}</code>\n"
-            f"🛡 Recovery: <code>{html.escape(rec)}</code>\n"
-            f"🔐 2FA Key: <code>{html.escape(two_fa)}</code>\n"
+            f"📅 Vintage (>30 Days): <b>{is_old}</b>\n\n"
+            f"📧 Email    : <code>{html.escape(email)}</code>\n"
+            f"🔑 Password : <code>{html.escape(pwd)}</code>\n"
+            f"🛡 Recovery : <code>{html.escape(rec)}</code>\n"
+            f"🔐 2FA Key  : <code>{html.escape(two_fa)}</code>\n"
             f"📅 Submitted: {now_str}"
         ),
         parse_mode="HTML",
@@ -778,16 +792,17 @@ async def finalize_and_save_sub(message: types.Message, state: FSMContext):
     )
 
     confirm_card = (
-        "✅ <b>Task submitted successfully!</b>\n"
+        "✅ <b>Account Submitted Successfully!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📧 Email: <code>{html.escape(email)}</code>\n\n"
-        "Your task is now being processed.\n"
-        "Check your balance later for updates."
+        f"📧 Email   : <code>{html.escape(email)}</code>\n"
+        f"💵 Payout  : <b>₹{r_est:.2f}</b> (Upon verification)\n"
+        "⏳ Status  : <b>Under Review Queue</b>\n\n"
+        "Track live progress inside <b>📊 My Submissions</b>."
     )
     await message.answer(confirm_card, parse_mode="HTML", reply_markup=kb_main_menu())
     await state.clear()
 
-# ======================= ADMIN VERIFICATION =======================
+# ======================= ADMIN ACTIONS =======================
 @dp.callback_query(F.data.startswith("adm_app_"))
 async def admin_accept_sub(call: types.CallbackQuery):
     sub_id = int(call.data.split("_")[2])
@@ -795,7 +810,7 @@ async def admin_accept_sub(call: types.CallbackQuery):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT user_id, email, status, acc_type FROM submissions WHERE id=$1", sub_id)
         if not row or str(row['status']).lower() != "pending":
-            await call.answer("This task is already processed!", show_alert=True)
+            await call.answer("This account has already been processed!", show_alert=True)
             return
 
         uid = int(row['user_id'])
@@ -814,7 +829,7 @@ async def admin_accept_sub(call: types.CallbackQuery):
             try:
                 await bot.send_message(
                     chat_id=referrer,
-                    text=f"🎁 <b>Affiliate Bonus!</b> You earned <b>₹{ref_bonus:.2f}</b> from a referral submission."
+                    text=f"💎 <b>Referral Bonus!</b> Earned <b>₹{ref_bonus:.2f}</b> from a referral submission."
                 )
             except Exception:
                 pass
@@ -823,18 +838,18 @@ async def admin_accept_sub(call: types.CallbackQuery):
         await bot.send_message(
             chat_id=uid,
             text=(
-                f"🎉 <b>Account Verified & Credited!</b>\n"
+                f"🎉 <b>Account Verified & Approved!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📧 Account: <code>{html.escape(mail)}</code>\n"
-                f"💵 Reward Added: <b>+₹{reward:.2f}</b>\n"
+                f"💵 Reward Credited: <b>+₹{reward:.2f}</b>\n"
                 f"💼 Updated Balance: <b>₹{float(new_bal):.2f}</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "You can withdraw your balance in <b>💼 My Wallet</b>!"
+                "Funds are ready to withdraw in <b>💼 My Wallet</b>!"
             ),
             parse_mode="HTML"
         )
     except Exception as e:
-        print(f"Error sending approval notification: {e}")
+        print(f"Error notifying: {e}")
 
     await call.message.edit_text(f"{call.message.text}\n\n🟢 <b>STATUS: APPROVED (+₹{reward:.2f})</b>", parse_mode="HTML")
     await call.answer(f"Approved! +₹{reward:.2f} credited.")
@@ -845,14 +860,14 @@ async def admin_reject_menu_open(call: types.CallbackQuery):
     async with db_pool.acquire() as conn:
         st = await conn.fetchval("SELECT status FROM submissions WHERE id=$1", sub_id)
         if not st or str(st).lower() != "pending":
-            await call.answer("This task is already processed!", show_alert=True)
+            await call.answer("Already processed!", show_alert=True)
             return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Incorrect Password", callback_data=f"rjact_{sub_id}_Wrong Password")],
-        [InlineKeyboardButton(text="🔒 2FA / Phone Lock Triggered", callback_data=f"rjact_{sub_id}_2FA / Phone Lock")],
-        [InlineKeyboardButton(text="⚠️ Account Suspended / Flagged", callback_data=f"rjact_{sub_id}_Account Flagged")],
-        [InlineKeyboardButton(text="✏️ Custom Reason (Type)", callback_data=f"rjcustom_{sub_id}")],
+        [InlineKeyboardButton(text="❌ Wrong Password", callback_data=f"rjact_{sub_id}_Wrong Password")],
+        [InlineKeyboardButton(text="🔒 2FA / OTP Verification Challenge", callback_data=f"rjact_{sub_id}_2FA / OTP Locked")],
+        [InlineKeyboardButton(text="⚠️ Account Disabled / Banned", callback_data=f"rjact_{sub_id}_Account Disabled")],
+        [InlineKeyboardButton(text="✏️ Type Custom Reason", callback_data=f"rjcustom_{sub_id}")],
         [InlineKeyboardButton(text="🔙 Cancel Action", callback_data=f"rjcancel_{sub_id}")]
     ])
     await call.message.edit_reply_markup(reply_markup=kb)
@@ -865,7 +880,7 @@ async def admin_reject_undo(call: types.CallbackQuery):
 
     restore_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{sub_id}"),
-        InlineKeyboardButton(text="❌ Reject Task", callback_data=f"adm_rejmenu_{sub_id}")
+        InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{sub_id}")
     ]])
     await call.message.edit_reply_markup(reply_markup=restore_kb)
     await call.answer()
@@ -879,7 +894,7 @@ async def admin_reject_quick(call: types.CallbackQuery):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT user_id, email, status FROM submissions WHERE id=$1", sub_id)
         if not row or str(row['status']).lower() != "pending":
-            await call.answer("This task is already processed!", show_alert=True)
+            await call.answer("Task already processed!", show_alert=True)
             return
 
         uid = int(row['user_id'])
@@ -895,12 +910,12 @@ async def admin_reject_quick(call: types.CallbackQuery):
                 f"📧 Account: <code>{html.escape(mail)}</code>\n"
                 f"⚠️ Reason: <b>{html.escape(reason)}</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Please verify credentials and submit fresh tasks."
+                "Please check credentials and submit fresh tasks."
             ),
             parse_mode="HTML"
         )
     except Exception as e:
-        print(f"Error sending rejection notification: {e}")
+        print(f"Error notifying: {e}")
 
     await call.message.edit_text(f"{call.message.text}\n\n🔴 <b>STATUS: REJECTED ({html.escape(reason)})</b>", parse_mode="HTML")
     await call.answer("Rejected.")
@@ -909,7 +924,7 @@ async def admin_reject_quick(call: types.CallbackQuery):
 async def admin_reject_custom_start(call: types.CallbackQuery, state: FSMContext):
     sub_id = int(call.data.split("_")[1])
     await state.update_data(target_sub_id=sub_id)
-    await call.message.reply(f"✏️ <b>Send custom rejection reason for #{sub_id}:</b>", parse_mode="HTML")
+    await call.message.reply(f"✏️ <b>Enter custom rejection reason for #{sub_id}:</b>", parse_mode="HTML")
     await state.set_state(AdminState.waiting_for_custom_reject)
     await call.answer()
 
@@ -936,7 +951,7 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
                         f"📧 Account: <code>{html.escape(mail)}</code>\n"
                         f"⚠️ Reason: <b>{html.escape(reason)}</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "Check details in <b>📁 My Accounts</b>."
+                        "Details recorded in <b>📊 My Submissions</b>."
                     ),
                     parse_mode="HTML"
                 )
@@ -965,11 +980,11 @@ async def admin_terminal(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 Upload Task Stock", callback_data="adm_upload_stock")],
         [
-            InlineKeyboardButton(text=f"⚙️ Readymade (₹{r_ready:.2f})", callback_data="rate_change_readymade"),
-            InlineKeyboardButton(text=f"⚙️ Bot Tasks (₹{r_bot:.2f})", callback_data="rate_change_botdata")
+            InlineKeyboardButton(text=f"⚙️ Readymade Rate (₹{r_ready:.2f})", callback_data="rate_change_readymade"),
+            InlineKeyboardButton(text=f"⚙️ Bot Task Rate (₹{r_bot:.2f})", callback_data="rate_change_botdata")
         ],
         [
-            InlineKeyboardButton(text=f"🎁 Affiliate Bonus (₹{r_ref:.2f})", callback_data="rate_change_ref"),
+            InlineKeyboardButton(text=f"🎁 Referral Bonus (₹{r_ref:.2f})", callback_data="rate_change_ref"),
             InlineKeyboardButton(text="💳 Adjust Balance", callback_data="adm_add_bal")
         ]
     ])
@@ -977,14 +992,14 @@ async def admin_terminal(message: types.Message):
     card = (
         "👑 <b>Executive Admin Terminal</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Active Users      : <b>{total_users or 0}</b>\n"
-        f"📦 Available Stock   : <b>{stock_count}</b> slots\n"
-        f"⏳ Pending Audits    : <b>{pending_subs or 0}</b>\n"
-        f"💸 Pending Payouts   : <b>{pending_payouts or 0}</b>\n\n"
-        "💰 <b>Active Rates:</b>\n"
-        f"• Readymade Accounts : ₹{r_ready:.2f}\n"
-        f"• Bot Allocation Tasks: ₹{r_bot:.2f}\n"
-        f"• Referral Commission: ₹{r_ref:.2f}"
+        f"👥 Total Users      : <b>{total_users or 0}</b>\n"
+        f"📦 Available Stock  : <b>{stock_count}</b> profiles\n"
+        f"⏳ Pending Audits   : <b>{pending_subs or 0}</b>\n"
+        f"💸 Pending Payouts  : <b>{pending_payouts or 0}</b>\n\n"
+        "💰 <b>Current Rates:</b>\n"
+        f"• Readymade Account Rate : ₹{r_ready:.2f}\n"
+        f"• Bot Task Account Rate  : ₹{r_bot:.2f}\n"
+        f"• Referral Commission    : ₹{r_ref:.2f}"
     )
     await message.answer(card, parse_mode="HTML", reply_markup=kb)
 
@@ -993,11 +1008,9 @@ async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     msg = (
-        "📥 <b>Upload Structured Task Data:</b>\n\n"
+        "📥 <b>Bulk Task Stock Upload:</b>\n\n"
         "Format per line:\n"
         "<code>FirstName|LastName|Month|Day|Year|Email|Password</code>\n\n"
-        "<b>Example:</b>\n"
-        "<code>David|Miller|August|19|1992|davidm92@gmail.com|Kx928shH!2</code>\n\n"
         "Send your batch now:"
     )
     await call.message.answer(msg, parse_mode="HTML")
@@ -1025,7 +1038,7 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
                 except Exception:
                     pass
 
-    await message.answer(f"✅ Successfully added <b>{added}</b> profiles into stock.", parse_mode="HTML")
+    await message.answer(f"✅ Added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data.startswith("rate_change_"))
@@ -1037,8 +1050,8 @@ async def adm_rate_prompt(call: types.CallbackQuery, state: FSMContext):
 
     labels = {
         "readymade": "Readymade Accounts",
-        "botdata": "Bot Allocation Tasks",
-        "ref": "Affiliate Commission per Account"
+        "botdata": "Bot Task Accounts",
+        "ref": "Referral Bonus"
     }
     await call.message.answer(f"⚙️ Enter new price rate for <b>{labels.get(r_type, r_type)}</b>:", parse_mode="HTML")
     await state.set_state(AdminState.waiting_for_new_rate)
@@ -1059,7 +1072,7 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
             "ref": "ref_bonus"
         }
         await set_setting(key_map[r_type], val)
-        await message.answer(f"✅ Rate updated to <b>₹{val:.2f}</b> successfully.", parse_mode="HTML")
+        await message.answer(f"✅ Price rate updated to <b>₹{val:.2f}</b> successfully.", parse_mode="HTML")
     except ValueError:
         await message.answer("⚠️ Please provide a valid numerical amount.")
     await state.clear()
@@ -1091,13 +1104,13 @@ async def adm_bal_amt_save(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Balance adjusted for user <code>{uid}</code> by ₹{amt:.2f}.", parse_mode="HTML")
     await state.clear()
 
-# ======================= WEB SERVER & ENTRY POINT =======================
+# ======================= WEB SERVER RUNNER =======================
 async def handle_ping(request):
-    return web.Response(text="GmailArena Bot Service is 100% Operational 24/7!")
+    return web.Response(text="GmailArena Bot Service Operational 24/7!")
 
 async def main():
     if not DATABASE_URL:
-        print("CRITICAL ERROR: DATABASE_URL environment variable is missing!")
+        print("CRITICAL ERROR: DATABASE_URL missing!")
         return
 
     await init_db()
@@ -1112,9 +1125,9 @@ async def main():
     await site.start()
 
     print(f"🔥 Web Server bound to port {port}")
-    print("🔥 CLEARING OLD TELEGRAM WEBHOOK / CONFLICTS...")
+    print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT POLLING STARTED...")
+    print("🔥 GMAILARENA BOT LIVE IN ENGLISH 🔥")
 
     await dp.start_polling(bot)
 
