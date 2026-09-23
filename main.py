@@ -23,25 +23,34 @@ BOT_TOKEN = "8822939259:AAGxqsUpMXIs1U01PAKkLJcCWqzHblf6Uog"
 ADMIN_ID = 5834588787
 CHANNEL_LINK = "https://t.me/Gmail_arena"
 SUPPORT_USER = "@sxhivv"
-DATABASE_URL = os.environ.get("DATABASE_URL")
+RAW_DB_URL = os.environ.get("DATABASE_URL", "")
 # =============================================================
+
+def get_clean_db_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    url = raw_url.strip()
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    url = re.sub(r'([&?])channel_binding=[^&]*(&?)', r'\1', url)
+    url = url.rstrip("&").rstrip("?")
+    return url
+
+DATABASE_URL = get_clean_db_url(RAW_DB_URL)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 db_pool = None
 
-# Strict UPI Regex Validator
 UPI_REGEX = re.compile(r'^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$')
 
-# ======================= DATABASE SETUP =======================
+# ======================= DATABASE SETUP & AUTO-MIGRATION =======================
 async def init_db():
     global db_pool
-    clean_db_url = DATABASE_URL
-    if clean_db_url and clean_db_url.startswith("postgres://"):
-        clean_db_url = clean_db_url.replace("postgres://", "postgresql://", 1)
-        
-    db_pool = await asyncpg.create_pool(clean_db_url)
+    print("Connecting to database...")
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with db_pool.acquire() as conn:
+        # Base tables
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -88,10 +97,24 @@ async def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+        """)
+
+        # Auto-migration: Purani tables me missing columns safely add karna
+        await conn.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL;
+            ALTER TABLE submissions ADD COLUMN IF NOT EXISTS created_at TEXT;
+            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS order_id TEXT;
+            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS utr TEXT DEFAULT '';
+            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS created_at TEXT;
+        """)
+
+        # Default settings values
+        await conn.execute("""
             INSERT INTO settings (key, value) VALUES ('rate_readymade', '12.0') ON CONFLICT (key) DO NOTHING;
             INSERT INTO settings (key, value) VALUES ('rate_botdata', '15.0') ON CONFLICT (key) DO NOTHING;
             INSERT INTO settings (key, value) VALUES ('ref_bonus', '1.0') ON CONFLICT (key) DO NOTHING;
         """)
+    print("Database tables & auto-migrations initialized successfully!")
 
 async def get_setting(key: str, default: float = 15.0):
     async with db_pool.acquire() as conn:
@@ -261,7 +284,7 @@ async def referral_dashboard(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# ======================= ADVANCED SUBMISSION HISTORY =======================
+# ======================= SUBMISSION HISTORY =======================
 async def get_submissions_card(user_id: int):
     async with db_pool.acquire() as conn:
         total = await conn.fetchval("SELECT COUNT(*) FROM submissions WHERE user_id=$1", user_id)
@@ -269,7 +292,6 @@ async def get_submissions_card(user_id: int):
         approved = await conn.fetchval("SELECT COUNT(*) FROM submissions WHERE user_id=$1 AND LOWER(status)='approved'", user_id)
         rejected = await conn.fetchval("SELECT COUNT(*) FROM submissions WHERE user_id=$1 AND LOWER(status)='rejected'", user_id)
         
-        # Pull last 10 submissions
         subs = await conn.fetch("""
             SELECT id, email, password, recovery, two_fa, status, rejection_reason, acc_type, created_at 
             FROM submissions WHERE user_id=$1 ORDER BY id DESC LIMIT 10
@@ -298,17 +320,14 @@ async def get_submissions_card(user_id: int):
             card += f"📅 Submitted: <code>{time_str}</code>\n"
 
             if st == "approved":
-                # Data hidden on approval
                 card += "🟢 Status: <b>✅ Verified & Paid</b>\n"
             elif st == "rejected":
-                # Show credentials so user can inspect and discuss with support
-                card += f"🔴 Status: <b>Disqualified</b>\n"
+                card += "🔴 Status: <b>Disqualified</b>\n"
                 card += f"⚠️ Reason: <i>{html.escape(row['rejection_reason'] or 'Invalid credentials')}</i>\n"
                 card += f"🔑 Pass: <code>{html.escape(row['password'])}</code> | Rec: <code>{html.escape(row['recovery'])}</code>\n"
                 if row['two_fa'] != 'None':
                     card += f"🔐 2FA: <code>{html.escape(row['two_fa'])}</code>\n"
             else:
-                # Pending: show credentials
                 card += "⏳ Status: <b>In Review</b>\n"
                 card += f"🔑 Pass: <code>{html.escape(row['password'])}</code> | Rec: <code>{html.escape(row['recovery'])}</code>\n"
                 if row['two_fa'] != 'None':
@@ -333,9 +352,9 @@ async def submissions_reload(call: types.CallbackQuery):
         await call.message.edit_text(card, parse_mode="HTML", reply_markup=kb)
         await call.answer("Submissions queue refreshed!")
     except Exception:
-        await call.answer("Queue is currently up to date.")
+        await call.answer("Queue is up to date.")
 
-# ======================= ADVANCED WALLET & WITHDRAWALS =======================
+# ======================= WALLET & WITHDRAWALS =======================
 @dp.message(F.text == "💼 My Wallet")
 async def wallet_view(message: types.Message):
     user_id = message.from_user.id
@@ -373,10 +392,7 @@ async def payout_history_view(call: types.CallbackQuery):
             FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 10
         """, user_id)
 
-    text = (
-        "📜 <b>Settlement & Payout Invoices</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    )
+    text = "📜 <b>Settlement & Payout Invoices</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     if not payouts:
         text += "<i>No withdrawal requests found.</i>\n"
     else:
@@ -451,7 +467,6 @@ async def initiate_cashout(call: types.CallbackQuery, state: FSMContext):
 async def process_cashout_target(message: types.Message, state: FSMContext):
     upi = message.text.strip().lower()
 
-    # Strict UPI Validation
     if not UPI_REGEX.match(upi) or " " in upi:
         await message.answer(
             "⚠️ <b>Invalid UPI ID Structure!</b>\n"
@@ -462,7 +477,6 @@ async def process_cashout_target(message: types.Message, state: FSMContext):
         return
 
     user_id = message.from_user.id
-    # Generate unique bot order ID
     order_id = f"GA-W-{random.randint(10000, 99999)}"
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
@@ -506,7 +520,7 @@ async def process_cashout_target(message: types.Message, state: FSMContext):
         f"📱 Transfer UPI  : <code>{html.escape(upi)}</code>\n"
         "⏳ Status        : <b>Processing Settlement</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "You can track this request in <b>💼 My Wallet ➔ Payout History</b>.",
+        "You can track this request in <b>💼 My Wallet ➔ View Payout History</b>.",
         parse_mode="HTML",
         reply_markup=main_reply_keyboard()
     )
@@ -525,7 +539,7 @@ async def admin_pay_request_utr(call: types.CallbackQuery, state: FSMContext):
             await call.answer("This withdrawal is already processed!", show_alert=True)
             return
 
-    await state.update_data(target_wid=w_id, wid_card_msg_id=call.message.message_id)
+    await state.update_data(target_wid=w_id)
     await call.message.reply(
         f"🧾 <b>Enter the UTR / Bank Reference Number for #{row['order_id']}:</b>\n"
         f"Amount: ₹{float(row['amount']):.2f} ➔ UPI: <code>{row['upi_id']}</code>\n\n"
@@ -782,7 +796,6 @@ async def admin_accept_sub(call: types.CallbackQuery):
         await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id=$2", reward, uid)
         new_bal = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", uid)
 
-        # Referral commission bonus
         referrer = await conn.fetchval("SELECT referred_by FROM users WHERE user_id=$1", uid)
         if referrer:
             ref_bonus = await get_setting("ref_bonus", 1.0)
@@ -922,7 +935,7 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Disqualified #{sub_id} with reason: <b>{html.escape(reason)}</b>", parse_mode="HTML")
     await state.clear()
 
-# ======================= COMPLETE ADMIN PANEL =======================
+# ======================= ADMIN PANEL =======================
 @dp.message(Command("admin"))
 async def admin_terminal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1067,11 +1080,15 @@ async def adm_bal_amt_save(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Balance adjusted for user <code>{uid}</code> by ₹{amt:.2f}.", parse_mode="HTML")
     await state.clear()
 
-# ======================= NATIVE HTTP WEB SERVER =======================
+# ======================= WEB SERVER & ENTRY POINT =======================
 async def handle_ping(request):
     return web.Response(text="GmailArena Bot Service is 100% Operational 24/7!")
 
 async def main():
+    if not DATABASE_URL:
+        print("CRITICAL ERROR: DATABASE_URL environment variable is missing!")
+        return
+
     await init_db()
 
     app = web.Application()
@@ -1084,7 +1101,9 @@ async def main():
     await site.start()
 
     print(f"🔥 Web Server bound to port {port}")
-    print("🔥 GMAILARENA COMPLETE ENTERPRISE BOT ACTIVE 🔥")
+    print("🔥 CLEARING OLD TELEGRAM WEBHOOK / CONFLICTS...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🔥 GMAILARENA BOT POLLING STARTED...")
 
     await dp.start_polling(bot)
 
