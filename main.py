@@ -43,6 +43,7 @@ dp = Dispatcher(storage=MemoryStorage())
 db_pool = None
 
 UPI_REGEX = re.compile(r'^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$')
+BEP20_REGEX = re.compile(r'^0x[a-fA-F0-9]{40}$')
 
 # ======================= DATABASE SETUP =======================
 async def init_db():
@@ -88,6 +89,8 @@ async def init_db():
                 order_id TEXT UNIQUE,
                 user_id BIGINT,
                 amount NUMERIC(10, 2),
+                method TEXT DEFAULT 'UPI',
+                payout_address TEXT,
                 upi_id TEXT,
                 utr TEXT DEFAULT '',
                 status TEXT DEFAULT 'pending',
@@ -104,6 +107,8 @@ async def init_db():
             ALTER TABLE submissions ADD COLUMN IF NOT EXISTS is_old TEXT DEFAULT 'No';
             ALTER TABLE submissions ADD COLUMN IF NOT EXISTS created_at TEXT;
             ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS order_id TEXT;
+            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS method TEXT DEFAULT 'UPI';
+            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS payout_address TEXT;
             ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS utr TEXT DEFAULT '';
             ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS created_at TEXT;
         """)
@@ -245,7 +250,11 @@ class SubmitState(StatesGroup):
     waiting_for_2fa_key = State()
 
 class WithdrawState(StatesGroup):
+    choosing_method = State()
     waiting_for_upi = State()
+    choosing_crypto_type = State()
+    waiting_for_binance_uid = State()
+    waiting_for_bep20_address = State()
 
 class AdminState(StatesGroup):
     waiting_for_bulk_stock = State()
@@ -354,10 +363,10 @@ async def wallet_handler(message: types.Message):
         f"💵 <b>Available Balance:</b> <b>₹{balance:.2f}</b>\n"
         f"💳 <b>Minimum Withdrawal:</b> ₹{min_p:.2f}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Direct UPI Bank Transfer with instant UTR proof."
+        "Direct UPI Bank Transfer or Crypto (USDT BEP-20 / Binance UID)."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Request Withdrawal (UPI)", callback_data="claim_funds")],
+        [InlineKeyboardButton(text="💸 Request Withdrawal", callback_data="claim_funds")],
         [InlineKeyboardButton(text="📜 Payout History", callback_data="view_payout_history")]
     ])
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -367,7 +376,7 @@ async def payout_history_call(call: types.CallbackQuery):
     uid = call.from_user.id
     async with db_pool.acquire() as conn:
         payouts = await conn.fetch("""
-            SELECT order_id, amount, upi_id, utr, status, created_at 
+            SELECT order_id, amount, method, payout_address, upi_id, utr, status, created_at 
             FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 8
         """, uid)
 
@@ -378,12 +387,16 @@ async def payout_history_call(call: types.CallbackQuery):
         for p in payouts:
             st = str(p['status']).lower()
             badge = "🟢 PAID" if st == "paid" else "⏳ PENDING"
+            method_str = p['method'] or "UPI"
+            address_str = p['payout_address'] or p['upi_id'] or "N/A"
+            
             text += f"<b>Order ID:</b> <code>{p['order_id']}</code>\n"
             text += f"💵 Amount: <b>₹{float(p['amount']):.2f}</b> | Status: {badge}\n"
-            text += f"📱 UPI: <code>{html.escape(p['upi_id'])}</code>\n"
+            text += f"🏷 Method: <b>{method_str}</b>\n"
+            text += f"🎯 Target: <code>{html.escape(address_str)}</code>\n"
             text += f"📅 Date: {p['created_at'] or 'Recent'}\n"
             if p['utr']:
-                text += f"🧾 Bank UTR: <code>{html.escape(p['utr'])}</code>\n"
+                text += f"🧾 Ref / TxID: <code>{html.escape(p['utr'])}</code>\n"
             text += "────────────────────────\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -408,14 +421,15 @@ async def back_to_wallet_call(call: types.CallbackQuery):
         f"💵 <b>Available Balance:</b> <b>₹{balance:.2f}</b>\n"
         f"💳 <b>Minimum Withdrawal:</b> ₹{min_p:.2f}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Direct UPI Bank Transfer with instant UTR proof."
+        "Direct UPI Bank Transfer or Crypto (USDT BEP-20 / Binance UID)."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Request Withdrawal (UPI)", callback_data="claim_funds")],
+        [InlineKeyboardButton(text="💸 Request Withdrawal", callback_data="claim_funds")],
         [InlineKeyboardButton(text="📜 Payout History", callback_data="view_payout_history")]
     ])
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
+# --- WITHDRAWAL METHOD SELECTION ---
 @dp.callback_query(F.data == "claim_funds")
 async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
     uid = call.from_user.id
@@ -431,6 +445,25 @@ async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
         await call.answer(f"Minimum threshold is ₹{min_p:.2f}. Your balance is ₹{balance:.2f}.", show_alert=True)
         return
 
+    method_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇮🇳 UPI Transfer", callback_data="wm_upi")],
+        [InlineKeyboardButton(text="⚡ Crypto (USDT / Binance)", callback_data="wm_crypto")]
+    ])
+    await call.message.answer(
+        "💳 <b>Select Withdrawal Gateway:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ <b>UPI Transfer:</b> Fast domestic bank transfer.\n"
+        "2️⃣ <b>Crypto Payout:</b> Binance Pay UID or USDT (BEP-20).\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Choose an option below:",
+        parse_mode="HTML",
+        reply_markup=method_kb
+    )
+    await state.set_state(WithdrawState.choosing_method)
+    await call.answer()
+
+@dp.callback_query(F.data == "wm_upi", WithdrawState.choosing_method)
+async def cashout_choose_upi(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer(
         "📱 <b>Please enter your UPI ID for settlement:</b>\n"
         "<i>Valid Handles: @okaxis, @paytm, @ybl, @oksbi, @okhdfcbank, @fam, etc.</i>\n\n"
@@ -441,6 +474,50 @@ async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(WithdrawState.waiting_for_upi)
     await call.answer()
 
+@dp.callback_query(F.data == "wm_crypto", WithdrawState.choosing_method)
+async def cashout_choose_crypto(call: types.CallbackQuery, state: FSMContext):
+    crypto_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟡 Binance UID (Pay ID)", callback_data="c_binance")],
+        [InlineKeyboardButton(text="🟢 USDT (BEP-20 Network)", callback_data="c_bep20")]
+    ])
+    await call.message.answer(
+        "⚡ <b>Select Crypto Payout Option:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ <b>Binance UID:</b> Instant transfer with 0 network fees.\n"
+        "2️⃣ <b>USDT (BEP-20):</b> Direct wallet transfer on Binance Smart Chain.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select your network:",
+        parse_mode="HTML",
+        reply_markup=crypto_kb
+    )
+    await state.set_state(WithdrawState.choosing_crypto_type)
+    await call.answer()
+
+@dp.callback_query(F.data == "c_binance", WithdrawState.choosing_crypto_type)
+async def cashout_choose_binance(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        "🟡 <b>Enter your 8–10 digit Binance User ID (UID):</b>\n"
+        "<i>(Found on your Binance app profile header)</i>\n\n"
+        "Example: <code>183948291</code>",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
+    )
+    await state.set_state(WithdrawState.waiting_for_binance_uid)
+    await call.answer()
+
+@dp.callback_query(F.data == "c_bep20", WithdrawState.choosing_crypto_type)
+async def cashout_choose_bep20(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        "🟢 <b>Enter your USDT BEP-20 (BSC) Wallet Address:</b>\n"
+        "<i>(Starts with <code>0x</code>)</i>\n\n"
+        "⚠️ <b>Note:</b> Send only BEP-20 (Binance Smart Chain) address.",
+        parse_mode="HTML",
+        reply_markup=kb_cancel()
+    )
+    await state.set_state(WithdrawState.waiting_for_bep20_address)
+    await call.answer()
+
+# --- WITHDRAWAL PROCESSORS ---
 @dp.message(WithdrawState.waiting_for_upi)
 async def cashout_process_upi(message: types.Message, state: FSMContext):
     upi = message.text.strip().lower()
@@ -453,7 +530,31 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         return
+    await finalize_cashout_order(message, state, "UPI", upi)
 
+@dp.message(WithdrawState.waiting_for_binance_uid)
+async def cashout_process_binance_uid(message: types.Message, state: FSMContext):
+    uid_str = message.text.strip()
+    if not uid_str.isdigit() or len(uid_str) < 6 or len(uid_str) > 12:
+        await message.answer(
+            "⚠️ <b>Invalid Binance UID!</b>\nMust be a valid 6-12 digit numeric user ID.\n\nTry again or press <b>❌ Cancel</b>:",
+            parse_mode="HTML"
+        )
+        return
+    await finalize_cashout_order(message, state, "Binance UID", uid_str)
+
+@dp.message(WithdrawState.waiting_for_bep20_address)
+async def cashout_process_bep20(message: types.Message, state: FSMContext):
+    addr = message.text.strip()
+    if not BEP20_REGEX.match(addr):
+        await message.answer(
+            "⚠️ <b>Invalid BEP-20 Address!</b>\nMust be a 42-character address starting with <code>0x</code>.\n\nTry again or press <b>❌ Cancel</b>:",
+            parse_mode="HTML"
+        )
+        return
+    await finalize_cashout_order(message, state, "USDT (BEP-20)", addr)
+
+async def finalize_cashout_order(message: types.Message, state: FSMContext, method: str, payout_target: str):
     uid = message.from_user.id
     order_id = f"GMA-W-{random.randint(10000, 99999)}"
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -469,12 +570,12 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
 
         await conn.execute("UPDATE users SET balance=0.00 WHERE user_id=$1", uid)
         w_id = await conn.fetchval("""
-            INSERT INTO withdrawals (order_id, user_id, amount, upi_id, status, created_at)
-            VALUES ($1, $2, $3, $4, 'pending', $5) RETURNING id
-        """, order_id, uid, balance, upi, now_str)
+            INSERT INTO withdrawals (order_id, user_id, amount, method, payout_address, upi_id, status, created_at)
+            VALUES ($1, $2, $3, $4, $5, $5, 'pending', $6) RETURNING id
+        """, order_id, uid, balance, method, payout_target, now_str)
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💸 Mark Paid & Assign UTR", callback_data=f"startpay_{w_id}")
+        InlineKeyboardButton(text="💸 Mark Paid & Assign TxID / Ref", callback_data=f"startpay_{w_id}")
     ]])
 
     await bot.send_message(
@@ -484,7 +585,8 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 User: @{message.from_user.username} (ID: <code>{uid}</code>)\n"
             f"💵 Amount: <b>₹{balance:.2f}</b>\n"
-            f"📱 UPI Target: <code>{html.escape(upi)}</code>\n"
+            f"🏷 Method: <b>{method}</b>\n"
+            f"🎯 Target Address: <code>{html.escape(payout_target)}</code>\n"
             f"📅 Placed: {now_str}"
         ),
         parse_mode="HTML",
@@ -496,7 +598,8 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🧾 Order ID     : <code>{order_id}</code>\n"
         f"💵 Payout Amount : <b>₹{balance:.2f}</b>\n"
-        f"📱 Target UPI    : <code>{html.escape(upi)}</code>\n"
+        f"🏷 Method        : <b>{method}</b>\n"
+        f"🎯 Destination   : <code>{html.escape(payout_target)}</code>\n"
         "⏳ Status        : <b>Processing Settlement</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "You can track this transaction in <b>💼 My Wallet ➔ Payout History</b>.",
@@ -505,7 +608,7 @@ async def cashout_process_upi(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
-# ======================= ADMIN PAYOUT WITH UTR =======================
+# ======================= ADMIN PAYOUT WITH UTR / TXID =======================
 @dp.callback_query(F.data.startswith("startpay_"))
 async def admin_pay_request_utr(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -513,15 +616,17 @@ async def admin_pay_request_utr(call: types.CallbackQuery, state: FSMContext):
     w_id = int(call.data.split("_")[1])
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT order_id, amount, upi_id, status FROM withdrawals WHERE id=$1", w_id)
+        row = await conn.fetchrow("SELECT order_id, amount, method, payout_address, upi_id, status FROM withdrawals WHERE id=$1", w_id)
         if not row or row['status'] != 'pending':
             await call.answer("This withdrawal is already processed!", show_alert=True)
             return
 
+    target_addr = row['payout_address'] or row['upi_id']
     await state.update_data(target_wid=w_id)
     await call.message.reply(
-        f"🧾 <b>Enter the UTR / Bank Reference Number for Order #{row['order_id']}:</b>\n"
-        f"Amount: ₹{float(row['amount']):.2f} | UPI: <code>{row['upi_id']}</code>\n\n"
+        f"🧾 <b>Enter the TxID / UTR / Reference Number for Order #{row['order_id']}:</b>\n"
+        f"Amount: ₹{float(row['amount']):.2f} | Method: <b>{row['method']}</b>\n"
+        f"Target: <code>{target_addr}</code>\n\n"
         "Type the reference number below:",
         parse_mode="HTML"
     )
@@ -537,12 +642,13 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
     w_id = data.get("target_wid")
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT order_id, user_id, amount, upi_id FROM withdrawals WHERE id=$1", w_id)
+        row = await conn.fetchrow("SELECT order_id, user_id, amount, method, payout_address, upi_id FROM withdrawals WHERE id=$1", w_id)
         if row:
             order_id = row['order_id']
             uid = row['user_id']
             amount = float(row['amount'])
-            upi = row['upi_id']
+            method = row['method']
+            target_addr = row['payout_address'] or row['upi_id']
 
             await conn.execute("UPDATE withdrawals SET status='paid', utr=$1 WHERE id=$2", utr_code, w_id)
             try:
@@ -551,19 +657,20 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
                     text=(
                         f"🎉 <b>Withdrawal Completed & Dispatched!</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🧾 Order ID   : <b>{order_id}</b>\n"
-                        f"💵 Amount     : <b>₹{amount:.2f}</b>\n"
-                        f"📱 Target UPI : <code>{html.escape(upi)}</code>\n"
-                        f"🔗 Bank UTR   : <code>{html.escape(utr_code)}</code>\n"
+                        f"🧾 Order ID     : <b>{order_id}</b>\n"
+                        f"💵 Amount       : <b>₹{amount:.2f}</b>\n"
+                        f"🏷 Method       : <b>{method}</b>\n"
+                        f"🎯 Destination  : <code>{html.escape(target_addr)}</code>\n"
+                        f"🔗 TxID / Ref   : <code>{html.escape(utr_code)}</code>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "Funds have been transferred to your bank account."
+                        "Funds have been successfully sent to your destination."
                     ),
                     parse_mode="HTML"
                 )
             except Exception as e:
                 print(f"Error notifying: {e}")
 
-    await message.answer(f"✅ Order <b>{order_id}</b> settled with UTR: <code>{utr_code}</code>", parse_mode="HTML")
+    await message.answer(f"✅ Order <b>{order_id}</b> settled with Ref: <code>{utr_code}</code>", parse_mode="HTML")
     await state.clear()
 
 # ======================= MY SUBMISSIONS DASHBOARD =======================
@@ -1288,7 +1395,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH SUB ID TRACKING 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH SUB ID & DUAL PAYOUT (UPI + CRYPTO) 🔥")
 
     await dp.start_polling(bot)
 
