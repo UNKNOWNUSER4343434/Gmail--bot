@@ -23,6 +23,7 @@ from aiogram.types import (
 BOT_TOKEN = "8822939259:AAGxqsUpMXIs1U01PAKkLJcCWqzHblf6Uog"
 ADMIN_ID = 5834588787
 CHANNEL_LINK = "https://t.me/Gmail_arena"
+PAYOUT_PROOF_CHANNEL = "@gmail_payouts"
 SUPPORT_USER = "@sxhivv"
 RAW_DB_URL = os.environ.get("DATABASE_URL", "")
 TASK_TIMEOUT_SECONDS = 1800  # 30 Minutes
@@ -510,6 +511,7 @@ async def back_to_wallet_call(call: types.CallbackQuery):
     ])
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
+# --- WITHDRAWAL GATEWAY SELECTION ---
 @dp.callback_query(F.data == "claim_funds")
 async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
     uid = call.from_user.id
@@ -687,7 +689,7 @@ async def finalize_cashout_order(message: types.Message, state: FSMContext, meth
     )
     await state.clear()
 
-# ======================= ADMIN PAYOUT WITH UTR / TXID =======================
+# ======================= ADMIN PAYOUT WITH UTR / TXID + AUTO PROOF BROADCAST =======================
 @dp.callback_query(F.data.startswith("startpay_"))
 async def admin_pay_request_utr(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -721,15 +723,24 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
     w_id = data.get("target_wid")
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT order_id, user_id, amount, method, payout_address, upi_id FROM withdrawals WHERE id=$1", w_id)
+        row = await conn.fetchrow("""
+            SELECT w.order_id, w.user_id, w.amount, w.method, w.payout_address, w.upi_id, u.username 
+            FROM withdrawals w 
+            LEFT JOIN users u ON w.user_id = u.user_id 
+            WHERE w.id=$1
+        """, w_id)
         if row:
             order_id = row['order_id']
             uid = row['user_id']
             amount = float(row['amount'])
             method = row['method']
             target_addr = row['payout_address'] or row['upi_id']
+            username = row['username'] or "User"
+            now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
             await conn.execute("UPDATE withdrawals SET status='paid', utr=$1 WHERE id=$2", utr_code, w_id)
+
+            # 1. User Private Notification
             try:
                 await bot.send_message(
                     chat_id=uid,
@@ -747,9 +758,41 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
                     parse_mode="HTML"
                 )
             except Exception as e:
-                print(f"Error notifying: {e}")
+                print(f"Error notifying user: {e}")
 
-    await message.answer(f"✅ Order <b>{order_id}</b> settled with Ref: <code>{utr_code}</code>", parse_mode="HTML")
+            # 2. Mask destination for public security
+            if "@" in target_addr:
+                parts = target_addr.split("@")
+                masked_target = parts[0][:2] + "****" + parts[0][-1:] + "@" + parts[1] if len(parts[0]) > 2 else "****@" + parts[1]
+            elif target_addr.startswith("0x") and len(target_addr) == 42:
+                masked_target = target_addr[:6] + "..." + target_addr[-4:]
+            elif len(target_addr) > 5:
+                masked_target = target_addr[:3] + "****" + target_addr[-2:]
+            else:
+                masked_target = target_addr
+
+            # 3. Automatic Payment Proof Broadcast to @gmail_payouts
+            proof_text = (
+                "💸 <b>WITHDRAWAL DISPATCHED SUCCESSFULLY!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧾 <b>Order ID   :</b> <code>{order_id}</code>\n"
+                f"👤 <b>User       :</b> @{html.escape(username)}\n"
+                f"🆔 <b>User ID    :</b> <code>{uid}</code>\n"
+                f"💵 <b>Amount     :</b> <b>₹{amount:.2f}</b>\n"
+                f"🏷 <b>Method     :</b> <b>{method}</b>\n"
+                f"🎯 <b>Destination:</b> <code>{html.escape(masked_target)}</code>\n"
+                f"🔗 <b>TxID / Ref :</b> <code>{html.escape(utr_code)}</code>\n"
+                f"📅 <b>Timestamp  :</b> {now_str}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "✨ <i>Keep crushing it! Work more, earn more. 🚀</i>"
+            )
+
+            try:
+                await bot.send_message(chat_id=PAYOUT_PROOF_CHANNEL, text=proof_text, parse_mode="HTML")
+            except Exception as e:
+                print(f"Error sending proof to {PAYOUT_PROOF_CHANNEL}: {e}")
+
+    await message.answer(f"✅ Order <b>{order_id}</b> settled! Proof posted to <b>{PAYOUT_PROOF_CHANNEL}</b>.", parse_mode="HTML")
     await state.clear()
 
 # ======================= MY SUBMISSIONS DASHBOARD =======================
@@ -849,7 +892,7 @@ async def submit_start_mode(message: types.Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=kb_sub_mode())
     await state.set_state(SubmitState.choosing_mode)
 
-# ----------------- FLOW 1: BOT TASK ACCOUNT (WITH 30 MIN TIMER) -----------------
+# ----------------- FLOW 1: BOT TASK ACCOUNT -----------------
 @dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
 async def submit_task_mode(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -917,7 +960,6 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
     assigned_at = data.get("assigned_at", 0)
     now_ts = int(time.time())
 
-    # Check 30-min expiration
     if (now_ts - assigned_at) > TASK_TIMEOUT_SECONDS:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_id)
@@ -935,7 +977,6 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
             VALUES ($1, $2, $3, $4, 'None', 'None', 'Fresh (Task)', 'pending', $5, $6) RETURNING id
         """, user.id, acc_type, email, pwd, now_str, stock_id)
         await conn.execute("UPDATE users SET total_submitted = total_submitted + 1 WHERE user_id=$1", user.id)
-        # Mark task permanently submitted (removes from active stock)
         await conn.execute("UPDATE task_stock SET status='submitted' WHERE id=$1", stock_id)
 
     r_est = await get_setting("rate_botdata", 15.0)
@@ -1112,7 +1153,7 @@ async def finalize_readymade_submission(message: types.Message, state: FSMContex
     await message.answer(confirm_card, parse_mode="HTML", reply_markup=kb_main_menu())
     await state.clear()
 
-# ======================= ADMIN ACTIONS (WITH AUTO-RESTOCK ON REJECT) =======================
+# ======================= ADMIN ACTIONS =======================
 @dp.callback_query(F.data.startswith("adm_app_"))
 async def admin_accept_sub(call: types.CallbackQuery):
     sub_id = int(call.data.split("_")[2])
@@ -1214,7 +1255,7 @@ async def admin_reject_quick(call: types.CallbackQuery):
 
         await conn.execute("UPDATE submissions SET status='rejected', rejection_reason=$1 WHERE id=$2", reason, sub_id)
 
-        # Auto-return bot data to available stock pool if rejected!
+        # Return to stock if bot task was rejected
         if stock_ref:
             await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_ref)
 
@@ -1569,7 +1610,6 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Successfully added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
     await state.clear()
 
-# --- 7. CHANGE RATES ---
 @dp.callback_query(F.data.startswith("rate_change_"))
 async def adm_rate_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1624,7 +1664,6 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Please provide a valid numerical amount.")
     await state.clear()
 
-# --- 8. ADJUST USER BALANCE ---
 @dp.callback_query(F.data == "adm_add_bal")
 async def adm_bal_id_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1678,7 +1717,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH MASTER ADMIN CONTROLS 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH AUTO PROOF CHANNEL BROADCAST 🔥")
 
     await dp.start_polling(bot)
 
