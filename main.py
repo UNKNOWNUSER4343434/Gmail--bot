@@ -107,7 +107,6 @@ async def init_db():
             );
         """)
 
-        # Auto-migration columns check
         await conn.execute("""
             ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;
             ALTER TABLE task_stock ADD COLUMN IF NOT EXISTS assigned_at BIGINT DEFAULT 0;
@@ -182,11 +181,10 @@ async def task_expiry_worker():
                             await bot.send_message(
                                 chat_id=assigned_uid,
                                 text=(
-                                    "⏰ <b>Task Time Expired! (30 Minutes Over)</b>\n"
+                                    "⏰ <b>Task Window Expired! (30 Minutes Over)</b>\n"
                                     "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"Your allocated task for <code>{task['email']}</code> was not submitted in time.\n"
-                                    "The credentials have been returned to the public stock.\n\n"
-                                    "Tap <b>⚡ Submit Gmail Account</b> whenever you are ready to claim a fresh task."
+                                    f"Your task for <code>{task['email']}</code> was not submitted in time.\n"
+                                    "The profile has been returned to available stock."
                                 ),
                                 parse_mode="HTML"
                             )
@@ -302,7 +300,7 @@ def build_task_card_text(row: dict, r_bot: float, assigned_at: int):
         f"⏳ <b>Time Remaining:</b> <b>{mins}m {secs:02d}s</b> (30 Min Window)\n\n"
         "⚠️ <b>STRICT WARNING:</b>\n"
         "1. Create the account using <b>EXACT credentials above</b>.\n"
-        "2. Do NOT press 'Done' without creating the account. Submitting fake or unprocessed data will result in a <b>Permanent Account Ban</b>!\n\n"
+        "2. Do NOT press 'Done' without creating the account. Submitting fake data will result in a <b>Permanent Account Ban</b>!\n\n"
         "➡️ Create this Gmail on Google, then tap <b>✅ Done / Created</b> below:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -337,6 +335,7 @@ class AdminState(StatesGroup):
     waiting_for_custom_reject = State()
     waiting_for_utr = State()
     waiting_for_ban_uid = State()
+    waiting_for_del_stock = State()
 
 # ======================= BAN CHECK MIDDLEWARE =======================
 @dp.message.outer_middleware()
@@ -511,7 +510,6 @@ async def back_to_wallet_call(call: types.CallbackQuery):
     ])
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-# --- WITHDRAWAL GATEWAY SELECTION ---
 @dp.callback_query(F.data == "claim_funds")
 async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
     uid = call.from_user.id
@@ -937,7 +935,7 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
             VALUES ($1, $2, $3, $4, 'None', 'None', 'Fresh (Task)', 'pending', $5, $6) RETURNING id
         """, user.id, acc_type, email, pwd, now_str, stock_id)
         await conn.execute("UPDATE users SET total_submitted = total_submitted + 1 WHERE user_id=$1", user.id)
-        # Mark task permanently submitted
+        # Mark task permanently submitted (removes from active stock)
         await conn.execute("UPDATE task_stock SET status='submitted' WHERE id=$1", stock_id)
 
     r_est = await get_setting("rate_botdata", 15.0)
@@ -1288,7 +1286,7 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ SUB #{sub_id} rejected with reason: <b>{html.escape(reason)}</b> (Stock Returned)", parse_mode="HTML")
     await state.clear()
 
-# ======================= ADMIN DASHBOARD (BAN / UNBAN SYSTEM) =======================
+# ======================= ADMIN DASHBOARD & ADVANCED CONTROLS =======================
 @dp.message(Command("admin"))
 async def admin_terminal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1305,16 +1303,26 @@ async def admin_terminal(message: types.Message):
     r_ref = await get_setting("ref_bonus", 1.0)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Upload Task Stock", callback_data="adm_upload_stock")],
         [
-            InlineKeyboardButton(text=f"⚙️ Readymade Rate (₹{r_ready:.2f})", callback_data="rate_change_readymade"),
-            InlineKeyboardButton(text=f"⚙️ Bot Task Rate (₹{r_bot:.2f})", callback_data="rate_change_botdata")
+            InlineKeyboardButton(text=f"⏳ Pending Audits ({pending_subs or 0})", callback_data="adm_view_pending"),
+            InlineKeyboardButton(text=f"💸 Pending Payouts ({pending_payouts or 0})", callback_data="adm_view_payouts")
         ],
         [
-            InlineKeyboardButton(text=f"🎁 Referral Bonus (₹{r_ref:.2f})", callback_data="rate_change_ref"),
+            InlineKeyboardButton(text="📥 Upload Stock", callback_data="adm_upload_stock"),
+            InlineKeyboardButton(text=f"📦 View Stock ({stock_count})", callback_data="adm_view_stock")
+        ],
+        [
+            InlineKeyboardButton(text="🗑 Remove Stock Mail", callback_data="adm_del_stock"),
+            InlineKeyboardButton(text="🚫 Ban / Unban User", callback_data="adm_toggle_ban")
+        ],
+        [
+            InlineKeyboardButton(text=f"⚙️ Readymade (₹{r_ready:.2f})", callback_data="rate_change_readymade"),
+            InlineKeyboardButton(text=f"⚙️ Bot Task (₹{r_bot:.2f})", callback_data="rate_change_botdata")
+        ],
+        [
+            InlineKeyboardButton(text=f"🎁 Refer Bonus (₹{r_ref:.2f})", callback_data="rate_change_ref"),
             InlineKeyboardButton(text="💳 Adjust Balance", callback_data="adm_add_bal")
-        ],
-        [InlineKeyboardButton(text="🚫 Ban / Unban User", callback_data="adm_toggle_ban")]
+        ]
     ])
 
     card = (
@@ -1325,12 +1333,131 @@ async def admin_terminal(message: types.Message):
         f"⏳ Pending Audits   : <b>{pending_subs or 0}</b>\n"
         f"💸 Pending Payouts  : <b>{pending_payouts or 0}</b>\n\n"
         "💰 <b>Current Rates:</b>\n"
-        f"• Readymade Account Rate : ₹{r_ready:.2f}\n"
-        f"• Bot Task Account Rate  : ₹{r_bot:.2f}\n"
-        f"• Referral Commission    : ₹{r_ref:.2f}"
+        f"• Readymade Rate : ₹{r_ready:.2f}\n"
+        f"• Bot Task Rate  : ₹{r_bot:.2f}\n"
+        f"• Refer Bonus    : ₹{r_ref:.2f}"
     )
     await message.answer(card, parse_mode="HTML", reply_markup=kb)
 
+# --- 1. VIEW PENDING SUBMISSIONS ---
+@dp.callback_query(F.data == "adm_view_pending")
+async def adm_view_pending_subs(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    async with db_pool.acquire() as conn:
+        subs = await conn.fetch("""
+            SELECT id, user_id, acc_type, email, password, recovery, two_fa, created_at 
+            FROM submissions WHERE LOWER(status)='pending' ORDER BY id ASC LIMIT 5
+        """)
+
+    if not subs:
+        await call.answer("No pending submissions found!", show_alert=True)
+        return
+
+    for s in subs:
+        r_est = await (get_setting("rate_botdata", 15.0) if "Bot" in str(s['acc_type']) else get_setting("rate_readymade", 12.0))
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{s['id']}"),
+            InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{s['id']}")
+        ]])
+        text = (
+            f"⏳ <b>Pending Submission [SUB #{s['id']}]</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 User ID : <code>{s['user_id']}</code>\n"
+            f"🏷 Type    : <b>{s['acc_type']}</b>\n"
+            f"📧 Email   : <code>{html.escape(s['email'])}</code>\n"
+            f"🔑 Pass    : <code>{html.escape(s['password'])}</code>\n"
+            f"🛡 Rec     : <code>{html.escape(s['recovery'] or 'None')}</code>\n"
+            f"🔐 2FA     : <code>{html.escape(s['two_fa'] or 'None')}</code>\n"
+            f"📅 Date    : {s['created_at']}"
+        )
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+# --- 2. VIEW AVAILABLE STOCK ---
+@dp.callback_query(F.data == "adm_view_stock")
+async def adm_view_stock_list(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    async with db_pool.acquire() as conn:
+        stock = await conn.fetch("SELECT id, first_name, last_name, email, password FROM task_stock WHERE status='available' ORDER BY id ASC LIMIT 15")
+
+    if not stock:
+        await call.answer("Available stock is completely empty!", show_alert=True)
+        return
+
+    text = "📦 <b>Available Bot Task Stock (First 15):</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for item in stock:
+        text += f"• <b>[ID: {item['id']}]</b> <code>{item['email']}</code> | Pass: <code>{item['password']}</code> ({item['first_name']} {item['last_name']})\n"
+    text += "\n<i>To remove any profile, use the '🗑 Remove Stock Mail' button.</i>"
+
+    await call.message.answer(text, parse_mode="HTML")
+    await call.answer()
+
+# --- 3. REMOVE MAIL FROM STOCK ---
+@dp.callback_query(F.data == "adm_del_stock")
+async def adm_del_stock_prompt(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.message.answer("🗑 <b>Enter the Stock Task ID or Email Address to delete:</b>", parse_mode="HTML")
+    await state.set_state(AdminState.waiting_for_del_stock)
+    await call.answer()
+
+@dp.message(AdminState.waiting_for_del_stock)
+async def adm_del_stock_process(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    target = message.text.strip()
+
+    async with db_pool.acquire() as conn:
+        if target.isdigit():
+            res = await conn.execute("DELETE FROM task_stock WHERE id=$1", int(target))
+        else:
+            res = await conn.execute("DELETE FROM task_stock WHERE email=$1", target)
+
+    if "DELETE 0" in res:
+        await message.answer(f"⚠️ No stock profile found matching: <code>{html.escape(target)}</code>", parse_mode="HTML")
+    else:
+        await message.answer(f"✅ Successfully removed profile <code>{html.escape(target)}</code> from stock.", parse_mode="HTML")
+    await state.clear()
+
+# --- 4. VIEW PENDING PAYOUTS ---
+@dp.callback_query(F.data == "adm_view_payouts")
+async def adm_view_payouts_list(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    async with db_pool.acquire() as conn:
+        payouts = await conn.fetch("""
+            SELECT id, order_id, user_id, amount, method, payout_address, upi_id, created_at 
+            FROM withdrawals WHERE LOWER(status)='pending' ORDER BY id ASC LIMIT 5
+        """)
+
+    if not payouts:
+        await call.answer("No pending withdrawals found!", show_alert=True)
+        return
+
+    for p in payouts:
+        method = p['method'] or 'UPI'
+        addr = p['payout_address'] or p['upi_id']
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💸 Mark Paid & Assign Ref/TxID", callback_data=f"startpay_{p['id']}")
+        ]])
+        text = (
+            f"💸 <b>Pending Cashout [{p['order_id']}]</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 User ID : <code>{p['user_id']}</code>\n"
+            f"💵 Amount  : <b>₹{float(p['amount']):.2f}</b>\n"
+            f"🏷 Method  : <b>{method}</b>\n"
+            f"🎯 Target  : <code>{html.escape(addr)}</code>\n"
+            f"📅 Date    : {p['created_at']}"
+        )
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+# --- 5. BAN / UNBAN USER ---
 @dp.callback_query(F.data == "adm_toggle_ban")
 async def adm_toggle_ban_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1360,6 +1487,7 @@ async def adm_toggle_ban_process(message: types.Message, state: FSMContext):
     await message.answer(f"User <code>{uid}</code> status is now: {status_str}", parse_mode="HTML")
     await state.clear()
 
+# --- 6. UPLOAD BULK STOCK ---
 @dp.callback_query(F.data == "adm_upload_stock")
 async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1441,6 +1569,7 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Successfully added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
     await state.clear()
 
+# --- 7. CHANGE RATES ---
 @dp.callback_query(F.data.startswith("rate_change_"))
 async def adm_rate_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1495,6 +1624,7 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Please provide a valid numerical amount.")
     await state.clear()
 
+# --- 8. ADJUST USER BALANCE ---
 @dp.callback_query(F.data == "adm_add_bal")
 async def adm_bal_id_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1548,7 +1678,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE (TIMER + AUTO-RESTOCK + BAN SYSTEM) 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH MASTER ADMIN CONTROLS 🔥")
 
     await dp.start_polling(bot)
 
