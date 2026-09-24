@@ -3,6 +3,7 @@ import re
 import random
 import asyncio
 import html
+import time
 from datetime import datetime
 from aiohttp import web
 import asyncpg
@@ -24,6 +25,7 @@ ADMIN_ID = 5834588787
 CHANNEL_LINK = "https://t.me/Gmail_arena"
 SUPPORT_USER = "@sxhivv"
 RAW_DB_URL = os.environ.get("DATABASE_URL", "")
+TASK_TIMEOUT_SECONDS = 1800  # 30 Minutes
 # =============================================================
 
 def get_clean_db_url(raw_url: str) -> str:
@@ -57,7 +59,8 @@ async def init_db():
                 username TEXT,
                 balance NUMERIC(10, 2) DEFAULT 0.00,
                 total_submitted INT DEFAULT 0,
-                referred_by BIGINT DEFAULT NULL
+                referred_by BIGINT DEFAULT NULL,
+                is_banned BOOLEAN DEFAULT FALSE
             );
             CREATE TABLE IF NOT EXISTS task_stock (
                 id SERIAL PRIMARY KEY,
@@ -69,7 +72,8 @@ async def init_db():
                 email TEXT UNIQUE,
                 password TEXT,
                 status TEXT DEFAULT 'available',
-                assigned_to BIGINT DEFAULT NULL
+                assigned_to BIGINT DEFAULT NULL,
+                assigned_at BIGINT DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS submissions (
                 id SERIAL PRIMARY KEY,
@@ -82,7 +86,8 @@ async def init_db():
                 is_old TEXT DEFAULT 'No',
                 status TEXT DEFAULT 'pending',
                 rejection_reason TEXT DEFAULT '',
-                created_at TEXT
+                created_at TEXT,
+                stock_ref_id INT DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id SERIAL PRIMARY KEY,
@@ -102,15 +107,13 @@ async def init_db():
             );
         """)
 
+        # Auto-migration columns check
         await conn.execute("""
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL;
-            ALTER TABLE submissions ADD COLUMN IF NOT EXISTS is_old TEXT DEFAULT 'No';
-            ALTER TABLE submissions ADD COLUMN IF NOT EXISTS created_at TEXT;
-            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS order_id TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;
+            ALTER TABLE task_stock ADD COLUMN IF NOT EXISTS assigned_at BIGINT DEFAULT 0;
+            ALTER TABLE submissions ADD COLUMN IF NOT EXISTS stock_ref_id INT DEFAULT NULL;
             ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS method TEXT DEFAULT 'UPI';
             ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS payout_address TEXT;
-            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS utr TEXT DEFAULT '';
-            ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS created_at TEXT;
         """)
 
         await conn.execute("""
@@ -119,6 +122,11 @@ async def init_db():
             INSERT INTO settings (key, value) VALUES ('ref_bonus', '1.0') ON CONFLICT (key) DO NOTHING;
         """)
     print("Database connection ready!")
+
+async def is_user_banned(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval("SELECT is_banned FROM users WHERE user_id=$1", user_id)
+        return bool(val)
 
 async def get_setting(key: str, default: float = 15.0):
     async with db_pool.acquire() as conn:
@@ -143,16 +151,55 @@ async def ensure_user(user_id: int, username: str = "", referrer_id: int = None)
         if not exists:
             ref = referrer_id if (referrer_id and referrer_id != user_id) else None
             await conn.execute("""
-                INSERT INTO users (user_id, username, balance, total_submitted, referred_by)
-                VALUES ($1, $2, 0.00, 0, $3)
+                INSERT INTO users (user_id, username, balance, total_submitted, referred_by, is_banned)
+                VALUES ($1, $2, 0.00, 0, $3, FALSE)
             """, user_id, username, ref)
         else:
             await conn.execute("UPDATE users SET username=$1 WHERE user_id=$2", username, user_id)
 
+# ======================= BACKGROUND 30-MIN EXPIRY WORKER =======================
+async def task_expiry_worker():
+    while True:
+        try:
+            now_ts = int(time.time())
+            async with db_pool.acquire() as conn:
+                expired_tasks = await conn.fetch("""
+                    SELECT id, assigned_to, email FROM task_stock 
+                    WHERE status='assigned' AND ($1 - assigned_at) > $2
+                """, now_ts, TASK_TIMEOUT_SECONDS)
+
+                for task in expired_tasks:
+                    task_id = task['id']
+                    assigned_uid = task['assigned_to']
+                    await conn.execute("""
+                        UPDATE task_stock 
+                        SET status='available', assigned_to=NULL, assigned_at=0 
+                        WHERE id=$1
+                    """, task_id)
+
+                    if assigned_uid:
+                        try:
+                            await bot.send_message(
+                                chat_id=assigned_uid,
+                                text=(
+                                    "⏰ <b>Task Time Expired! (30 Minutes Over)</b>\n"
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"Your allocated task for <code>{task['email']}</code> was not submitted in time.\n"
+                                    "The credentials have been returned to the public stock.\n\n"
+                                    "Tap <b>⚡ Submit Gmail Account</b> whenever you are ready to claim a fresh task."
+                                ),
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Expiry worker error: {e}")
+        await asyncio.sleep(30)
+
 # ======================= BROADCAST SYSTEM =======================
 async def broadcast_price_update(label: str, new_price: float):
     async with db_pool.acquire() as conn:
-        users = await conn.fetch("SELECT user_id FROM users")
+        users = await conn.fetch("SELECT user_id FROM users WHERE is_banned=FALSE")
 
     broadcast_msg = (
         "🚀 <b>PRICE UPDATE ALERT!</b>\n"
@@ -165,9 +212,8 @@ async def broadcast_price_update(label: str, new_price: float):
 
     sent = 0
     for u in users:
-        uid = u['user_id']
         try:
-            await bot.send_message(chat_id=uid, text=broadcast_msg, parse_mode="HTML")
+            await bot.send_message(chat_id=u['user_id'], text=broadcast_msg, parse_mode="HTML")
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -238,6 +284,32 @@ def kb_2fa():
         resize_keyboard=True
     )
 
+def build_task_card_text(row: dict, r_bot: float, assigned_at: int):
+    now_ts = int(time.time())
+    elapsed = now_ts - assigned_at
+    remaining = max(0, TASK_TIMEOUT_SECONDS - elapsed)
+    mins, secs = divmod(remaining, 60)
+
+    text = (
+        f"⚡ <b>Target Registration Credentials (Reward: ₹{r_bot:.2f}):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• First Name   : <code>{html.escape(row['first_name'])}</code>\n"
+        f"• Last Name    : <code>{html.escape(row['last_name'])}</code>\n"
+        f"• Date of Birth: <code>{html.escape(row['dob_month'])} {html.escape(str(row['dob_day']))}, {html.escape(str(row['dob_year']))}</code>\n"
+        f"• Suggested Mail: <code>{html.escape(row['email'])}</code>\n"
+        f"• Password     : <code>{html.escape(row['password'])}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ <b>Time Remaining:</b> <b>{mins}m {secs:02d}s</b> (30 Min Window)\n\n"
+        "⚠️ <b>STRICT WARNING:</b>\n"
+        "1. Create the account using <b>EXACT credentials above</b>.\n"
+        "2. Do NOT press 'Done' without creating the account. Submitting fake or unprocessed data will result in a <b>Permanent Account Ban</b>!\n\n"
+        "➡️ Create this Gmail on Google, then tap <b>✅ Done / Created</b> below:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Refresh Timer", callback_data=f"reftimer_{row['id']}")
+    ]])
+    return text, kb
+
 # ======================= FSM STATES =======================
 class SubmitState(StatesGroup):
     choosing_mode = State()
@@ -264,6 +336,16 @@ class AdminState(StatesGroup):
     waiting_for_addbal_amount = State()
     waiting_for_custom_reject = State()
     waiting_for_utr = State()
+    waiting_for_ban_uid = State()
+
+# ======================= BAN CHECK MIDDLEWARE =======================
+@dp.message.outer_middleware()
+async def ban_filter_middleware(handler, event: types.Message, data):
+    if event.from_user and await is_user_banned(event.from_user.id):
+        if event.from_user.id != ADMIN_ID:
+            await event.answer("🚫 <b>Your account has been permanently suspended for policy violations.</b>", parse_mode="HTML")
+            return
+    return await handler(event, data)
 
 # ======================= CANCEL ACTION =======================
 @dp.message(F.text == "❌ Cancel")
@@ -273,7 +355,7 @@ async def cancel_handler(message: types.Message, state: FSMContext):
     
     if assigned_stock_id:
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL WHERE id=$1", assigned_stock_id)
+            await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", assigned_stock_id)
 
     await state.clear()
     await message.answer("🔄 Operation cancelled. Returning to main menu:", reply_markup=kb_main_menu())
@@ -429,7 +511,7 @@ async def back_to_wallet_call(call: types.CallbackQuery):
     ])
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-# --- WITHDRAWAL METHOD SELECTION ---
+# --- WITHDRAWAL GATEWAY SELECTION ---
 @dp.callback_query(F.data == "claim_funds")
 async def cashout_initiate(call: types.CallbackQuery, state: FSMContext):
     uid = call.from_user.id
@@ -517,7 +599,6 @@ async def cashout_choose_bep20(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(WithdrawState.waiting_for_bep20_address)
     await call.answer()
 
-# --- WITHDRAWAL PROCESSORS ---
 @dp.message(WithdrawState.waiting_for_upi)
 async def cashout_process_upi(message: types.Message, state: FSMContext):
     upi = message.text.strip().lower()
@@ -624,7 +705,7 @@ async def admin_pay_request_utr(call: types.CallbackQuery, state: FSMContext):
     target_addr = row['payout_address'] or row['upi_id']
     await state.update_data(target_wid=w_id)
     await call.message.reply(
-        f"🧾 <b>Enter the TxID / UTR / Reference Number for Order #{row['order_id']}:</b>\n"
+        f"🧾 <b>Enter TxID / UTR / Reference for Order #{row['order_id']}:</b>\n"
         f"Amount: ₹{float(row['amount']):.2f} | Method: <b>{row['method']}</b>\n"
         f"Target: <code>{target_addr}</code>\n\n"
         "Type the reference number below:",
@@ -663,7 +744,7 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
                         f"🎯 Destination  : <code>{html.escape(target_addr)}</code>\n"
                         f"🔗 TxID / Ref   : <code>{html.escape(utr_code)}</code>\n"
                         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "Funds have been successfully sent to your destination."
+                        "Funds have been successfully transferred to your destination."
                     ),
                     parse_mode="HTML"
                 )
@@ -763,18 +844,19 @@ async def submit_start_mode(message: types.Message, state: FSMContext):
         "• Accounts must be clean, active, and accessible.\n\n"
         f"2️⃣ <b>⚡ Bot Task Account:</b> <b>₹{r_bot:.2f}</b> per account\n"
         "• We provide specific Name, DOB, and Password.\n"
-        "• Register the Gmail using exact bot credentials.\n"
+        "• <b>Time Window:</b> 30 Minutes to create and submit.\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Choose an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=kb_sub_mode())
     await state.set_state(SubmitState.choosing_mode)
 
-# ----------------- FLOW 1: BOT TASK ACCOUNT -----------------
+# ----------------- FLOW 1: BOT TASK ACCOUNT (WITH 30 MIN TIMER) -----------------
 @dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
 async def submit_task_mode(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     r_bot = await get_setting("rate_botdata", 15.0)
+    now_ts = int(time.time())
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -790,47 +872,73 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
             return
 
         stock_id = row['id']
-        await conn.execute("UPDATE task_stock SET status='assigned', assigned_to=$1 WHERE id=$2", uid, stock_id)
+        await conn.execute("""
+            UPDATE task_stock 
+            SET status='assigned', assigned_to=$1, assigned_at=$2 
+            WHERE id=$3
+        """, uid, now_ts, stock_id)
 
     await state.update_data(
         acc_type="Bot-Data Task",
         assigned_stock_id=stock_id,
         email=row['email'],
-        password=row['password']
+        password=row['password'],
+        assigned_at=now_ts
     )
 
-    task_card = (
-        f"⚡ <b>Target Registration Credentials (Reward: ₹{r_bot:.2f}):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• First Name   : <code>{html.escape(row['first_name'])}</code>\n"
-        f"• Last Name    : <code>{html.escape(row['last_name'])}</code>\n"
-        f"• Date of Birth: <code>{html.escape(row['dob_month'])} {html.escape(str(row['dob_day']))}, {html.escape(str(row['dob_year']))}</code>\n"
-        f"• Suggested Mail: <code>{html.escape(row['email'])}</code>\n"
-        f"• Password     : <code>{html.escape(row['password'])}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ <b>Strict Requirement:</b> Use the exact credentials above, otherwise payment will be rejected.\n\n"
-        "➡️ Once created, simply tap <b>✅ Done / Created</b> below:"
-    )
-    await message.answer(task_card, parse_mode="HTML", reply_markup=kb_bot_task_action())
+    card_text, timer_kb = build_task_card_text(dict(row), r_bot, now_ts)
+    await message.answer(card_text, parse_mode="HTML", reply_markup=timer_kb)
+    await message.answer("Tap <b>✅ Done / Created</b> below once you create it:", parse_mode="HTML", reply_markup=kb_bot_task_action())
     await state.set_state(SubmitState.waiting_for_task_action)
+
+@dp.callback_query(F.data.startswith("reftimer_"))
+async def refresh_task_timer(call: types.CallbackQuery, state: FSMContext):
+    task_id = int(call.data.split("_")[1])
+    r_bot = await get_setting("rate_botdata", 15.0)
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM task_stock WHERE id=$1", task_id)
+        if not row or row['status'] != 'assigned' or row['assigned_to'] != call.from_user.id:
+            await call.answer("This task is no longer active or has expired.", show_alert=True)
+            return
+
+    new_text, timer_kb = build_task_card_text(dict(row), r_bot, row['assigned_at'])
+    try:
+        await call.message.edit_text(new_text, parse_mode="HTML", reply_markup=timer_kb)
+        await call.answer("Timer updated!")
+    except Exception:
+        await call.answer("Time refreshed!")
 
 @dp.message(SubmitState.waiting_for_task_action, F.text == "✅ Done / Created")
 async def bot_task_done_clicked(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    email = data["email"]
-    pwd = data["password"]
-    acc_type = data["acc_type"]
+    email = data.get("email")
+    pwd = data.get("password")
+    acc_type = data.get("acc_type")
+    stock_id = data.get("assigned_stock_id")
+    assigned_at = data.get("assigned_at", 0)
+    now_ts = int(time.time())
+
+    # Check 30-min expiration
+    if (now_ts - assigned_at) > TASK_TIMEOUT_SECONDS:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_id)
+        await message.answer("⏰ <b>Your 30-minute window expired!</b>\nThe task has been reclaimed. Please request a new task.", reply_markup=kb_main_menu())
+        await state.clear()
+        return
+
     user = message.from_user
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
-
     await ensure_user(user.id, user.username or user.first_name)
 
     async with db_pool.acquire() as conn:
         sub_id = await conn.fetchval("""
-            INSERT INTO submissions (user_id, acc_type, email, password, recovery, two_fa, is_old, status, created_at)
-            VALUES ($1, $2, $3, $4, 'None', 'None', 'Fresh (Task)', 'pending', $5) RETURNING id
-        """, user.id, acc_type, email, pwd, now_str)
+            INSERT INTO submissions (user_id, acc_type, email, password, recovery, two_fa, is_old, status, created_at, stock_ref_id)
+            VALUES ($1, $2, $3, $4, 'None', 'None', 'Fresh (Task)', 'pending', $5, $6) RETURNING id
+        """, user.id, acc_type, email, pwd, now_str, stock_id)
         await conn.execute("UPDATE users SET total_submitted = total_submitted + 1 WHERE user_id=$1", user.id)
+        # Mark task permanently submitted
+        await conn.execute("UPDATE task_stock SET status='submitted' WHERE id=$1", stock_id)
 
     r_est = await get_setting("rate_botdata", 15.0)
 
@@ -1006,7 +1114,7 @@ async def finalize_readymade_submission(message: types.Message, state: FSMContex
     await message.answer(confirm_card, parse_mode="HTML", reply_markup=kb_main_menu())
     await state.clear()
 
-# ======================= ADMIN ACTIONS =======================
+# ======================= ADMIN ACTIONS (WITH AUTO-RESTOCK ON REJECT) =======================
 @dp.callback_query(F.data.startswith("adm_app_"))
 async def admin_accept_sub(call: types.CallbackQuery):
     sub_id = int(call.data.split("_")[2])
@@ -1097,14 +1205,20 @@ async def admin_reject_quick(call: types.CallbackQuery):
     reason = parts[2]
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id, email, status FROM submissions WHERE id=$1", sub_id)
+        row = await conn.fetchrow("SELECT user_id, email, status, stock_ref_id FROM submissions WHERE id=$1", sub_id)
         if not row or str(row['status']).lower() != "pending":
             await call.answer("Task already processed!", show_alert=True)
             return
 
         uid = int(row['user_id'])
         mail = row['email']
+        stock_ref = row['stock_ref_id']
+
         await conn.execute("UPDATE submissions SET status='rejected', rejection_reason=$1 WHERE id=$2", reason, sub_id)
+
+        # Auto-return bot data to available stock pool if rejected!
+        if stock_ref:
+            await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_ref)
 
     try:
         await bot.send_message(
@@ -1123,8 +1237,8 @@ async def admin_reject_quick(call: types.CallbackQuery):
     except Exception as e:
         print(f"Error notifying: {e}")
 
-    await call.message.edit_text(f"{call.message.text}\n\n🔴 <b>STATUS: REJECTED ({html.escape(reason)})</b>", parse_mode="HTML")
-    await call.answer("Rejected.")
+    await call.message.edit_text(f"{call.message.text}\n\n🔴 <b>STATUS: REJECTED ({html.escape(reason)}) [Data Restocked]</b>", parse_mode="HTML")
+    await call.answer("Rejected and restocked.")
 
 @dp.callback_query(F.data.startswith("rjcustom_"))
 async def admin_reject_custom_start(call: types.CallbackQuery, state: FSMContext):
@@ -1143,11 +1257,17 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
     reason = message.text.strip()
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id, email FROM submissions WHERE id=$1", sub_id)
+        row = await conn.fetchrow("SELECT user_id, email, stock_ref_id FROM submissions WHERE id=$1", sub_id)
         if row:
             uid = int(row['user_id'])
             mail = row['email']
+            stock_ref = row['stock_ref_id']
+
             await conn.execute("UPDATE submissions SET status='rejected', rejection_reason=$1 WHERE id=$2", reason, sub_id)
+
+            if stock_ref:
+                await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_ref)
+
             try:
                 await bot.send_message(
                     chat_id=uid,
@@ -1165,10 +1285,10 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
             except Exception:
                 pass
 
-    await message.answer(f"✅ SUB #{sub_id} rejected with reason: <b>{html.escape(reason)}</b>", parse_mode="HTML")
+    await message.answer(f"✅ SUB #{sub_id} rejected with reason: <b>{html.escape(reason)}</b> (Stock Returned)", parse_mode="HTML")
     await state.clear()
 
-# ======================= ADMIN DASHBOARD & STOCK PARSER =======================
+# ======================= ADMIN DASHBOARD (BAN / UNBAN SYSTEM) =======================
 @dp.message(Command("admin"))
 async def admin_terminal(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1193,7 +1313,8 @@ async def admin_terminal(message: types.Message):
         [
             InlineKeyboardButton(text=f"🎁 Referral Bonus (₹{r_ref:.2f})", callback_data="rate_change_ref"),
             InlineKeyboardButton(text="💳 Adjust Balance", callback_data="adm_add_bal")
-        ]
+        ],
+        [InlineKeyboardButton(text="🚫 Ban / Unban User", callback_data="adm_toggle_ban")]
     ])
 
     card = (
@@ -1209,6 +1330,35 @@ async def admin_terminal(message: types.Message):
         f"• Referral Commission    : ₹{r_ref:.2f}"
     )
     await message.answer(card, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data == "adm_toggle_ban")
+async def adm_toggle_ban_prompt(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.message.answer("Enter the Telegram User ID to Ban or Unban:")
+    await state.set_state(AdminState.waiting_for_ban_uid)
+    await call.answer()
+
+@dp.message(AdminState.waiting_for_ban_uid)
+async def adm_toggle_ban_process(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw_uid = message.text.strip()
+    if not raw_uid.isdigit():
+        await message.answer("⚠️ Please send a valid numeric Telegram ID.")
+        return
+
+    uid = int(raw_uid)
+    await ensure_user(uid)
+
+    async with db_pool.acquire() as conn:
+        curr_banned = await conn.fetchval("SELECT is_banned FROM users WHERE user_id=$1", uid)
+        new_status = not curr_banned
+        await conn.execute("UPDATE users SET is_banned=$1 WHERE user_id=$2", new_status, uid)
+
+    status_str = "🚫 <b>PERMANENTLY BANNED</b>" if new_status else "🟢 <b>UNBANNED / ACTIVE</b>"
+    await message.answer(f"User <code>{uid}</code> status is now: {status_str}", parse_mode="HTML")
+    await state.clear()
 
 @dp.callback_query(F.data == "adm_upload_stock")
 async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
@@ -1372,7 +1522,7 @@ async def adm_bal_amt_save(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Balance adjusted for user <code>{uid}</code> by ₹{amt:.2f}.", parse_mode="HTML")
     await state.clear()
 
-# ======================= WEB SERVER RUNNER =======================
+# ======================= WEB SERVER RUNNER & APP STARTUP =======================
 async def handle_ping(request):
     return web.Response(text="GmailArena Bot Service Operational 24/7!")
 
@@ -1382,6 +1532,9 @@ async def main():
         return
 
     await init_db()
+
+    # Launch background auto-expiry worker
+    asyncio.create_task(task_expiry_worker())
 
     app = web.Application()
     app.router.add_get("/", handle_ping)
@@ -1395,7 +1548,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH SUB ID & DUAL PAYOUT (UPI + CRYPTO) 🔥")
+    print("🔥 GMAILARENA BOT LIVE (TIMER + AUTO-RESTOCK + BAN SYSTEM) 🔥")
 
     await dp.start_polling(bot)
 
