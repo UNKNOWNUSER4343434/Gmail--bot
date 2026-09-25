@@ -59,6 +59,28 @@ def get_user_mention(user_id: int, first_name: str, username: str = None) -> str
         return f'<a href="tg://user?id={user_id}">{safe_name}</a> (@{username})'
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
+# ======================= AUTO RE-INDEX STOCK FUNCTION =======================
+async def reindex_stock_table(conn):
+    # Bache hue saare stock ko temporary order karke 1, 2, 3... me re-arrange karna
+    await conn.execute("""
+        DO $$
+        DECLARE
+            row_item RECORD;
+            new_id INT := 1;
+        BEGIN
+            FOR row_item IN (SELECT id FROM task_stock ORDER BY id ASC) LOOP
+                UPDATE task_stock SET id = new_id WHERE id = row_item.id;
+                new_id := new_id + 1;
+            END LOOP;
+        END $$;
+    """)
+    # Sequence ko reset karna taki agla stock current count + 1 se start ho
+    max_id = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM task_stock")
+    if max_id == 0:
+        await conn.execute("ALTER SEQUENCE task_stock_id_seq RESTART WITH 1")
+    else:
+        await conn.execute(f"SELECT setval('task_stock_id_seq', {max_id}, true)")
+
 # ======================= CHANNEL MEMBERSHIP CHECK =======================
 async def check_user_channels(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -170,7 +192,11 @@ async def init_db():
             INSERT INTO settings (key, value) VALUES ('rate_botdata', '15.0') ON CONFLICT (key) DO NOTHING;
             INSERT INTO settings (key, value) VALUES ('ref_bonus', '1.0') ON CONFLICT (key) DO NOTHING;
         """)
-    print("Database connection ready!")
+
+        # Startup time pe stock re-index check
+        await reindex_stock_table(conn)
+
+    print("Database connection ready with auto-reindexing!")
 
 async def is_user_banned(user_id: int) -> bool:
     async with db_pool.acquire() as conn:
@@ -398,7 +424,6 @@ async def access_filter_middleware(handler, event: types.Message, data):
         await event.answer("🚫 <b>Your account has been permanently suspended for policy violations.</b>", parse_mode="HTML")
         return
 
-    # Check force channel subscription for normal messages (except /start)
     if event.text and not event.text.startswith("/start") and uid != ADMIN_ID:
         is_joined = await check_user_channels(uid)
         if not is_joined:
@@ -464,7 +489,6 @@ async def start_handler(message: types.Message, state: FSMContext):
     uname = message.from_user.username or message.from_user.first_name
     await ensure_user(uid, uname, ref_id)
 
-    # Force Channel Join Check on /start
     is_joined = await check_user_channels(uid)
     if not is_joined:
         text, kb = get_force_join_card()
@@ -1366,6 +1390,7 @@ async def admin_reject_quick(call: types.CallbackQuery):
 
         if stock_ref:
             await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_ref)
+            await reindex_stock_table(conn)
 
     try:
         await bot.send_message(
@@ -1414,6 +1439,7 @@ async def admin_reject_custom_finish(message: types.Message, state: FSMContext):
 
             if stock_ref:
                 await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_ref)
+                await reindex_stock_table(conn)
 
             try:
                 await bot.send_message(
@@ -1549,7 +1575,7 @@ async def adm_view_stock_list(call: types.CallbackQuery):
     await call.message.answer(text, parse_mode="HTML")
     await call.answer()
 
-# --- 3. ADVANCED MULTI & RANGE REMOVE MAIL FROM STOCK ---
+# --- 3. ADVANCED MULTI & RANGE REMOVE MAIL FROM STOCK (WITH AUTO RE-INDEX) ---
 @dp.callback_query(F.data == "adm_del_stock")
 async def adm_del_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1563,6 +1589,7 @@ async def adm_del_stock_prompt(call: types.CallbackQuery, state: FSMContext):
         "3️⃣ <b>Single Item:</b> <code>7</code> ya <code>test@gmail.com</code>\n"
         "4️⃣ <b>Clear All:</b> <code>ALL</code> (Poora stock clear karne ke liye)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Note: Delete hone ke baad stock IDs automatically 1 se reorganize ho jayengi.</i>\n\n"
         "Apna command ya ID list yahan bhejein:"
     )
     await call.message.answer(msg, parse_mode="HTML")
@@ -1583,7 +1610,8 @@ async def adm_del_stock_process(message: types.Message, state: FSMContext):
                 deleted_count = int(res.split()[1])
             except:
                 deleted_count = 0
-            await message.answer(f"✅ Cleared entire available stock. (Total <b>{deleted_count}</b> profiles deleted).", parse_mode="HTML")
+            await reindex_stock_table(conn)
+            await message.answer(f"✅ Cleared entire available stock. (Total <b>{deleted_count}</b> profiles deleted). IDs reset to 1.", parse_mode="HTML")
             await state.clear()
             return
 
@@ -1599,7 +1627,8 @@ async def adm_del_stock_process(message: types.Message, state: FSMContext):
                 deleted_count = int(res.split()[1])
             except:
                 deleted_count = 0
-            await message.answer(f"✅ Range Delete Successful! Removed <b>{deleted_count}</b> profiles (IDs {start_id} to {end_id}).", parse_mode="HTML")
+            await reindex_stock_table(conn)
+            await message.answer(f"✅ Range Delete Successful! Removed <b>{deleted_count}</b> profiles. Remaining stock re-indexed from 1 onwards.", parse_mode="HTML")
             await state.clear()
             return
 
@@ -1612,7 +1641,8 @@ async def adm_del_stock_process(message: types.Message, state: FSMContext):
                     deleted_count = int(res.split()[1])
                 except:
                     deleted_count = 0
-                await message.answer(f"✅ Batch Delete Successful! Removed <b>{deleted_count}</b> profiles.", parse_mode="HTML")
+                await reindex_stock_table(conn)
+                await message.answer(f"✅ Batch Delete Successful! Removed <b>{deleted_count}</b> profiles. Stock re-indexed from 1 onwards.", parse_mode="HTML")
                 await state.clear()
                 return
 
@@ -1624,7 +1654,8 @@ async def adm_del_stock_process(message: types.Message, state: FSMContext):
         if "DELETE 0" in res:
             await message.answer(f"⚠️ No stock profile found matching: <code>{html.escape(target)}</code>", parse_mode="HTML")
         else:
-            await message.answer(f"✅ Successfully deleted profile: <code>{html.escape(target)}</code>", parse_mode="HTML")
+            await reindex_stock_table(conn)
+            await message.answer(f"✅ Successfully deleted profile: <code>{html.escape(target)}</code>. Remaining stock re-indexed.", parse_mode="HTML")
 
     await state.clear()
 
@@ -1696,7 +1727,7 @@ async def adm_toggle_ban_process(message: types.Message, state: FSMContext):
     await message.answer(f"User <code>{uid}</code> status is now: {status_str}", parse_mode="HTML")
     await state.clear()
 
-# --- 6. UPLOAD BULK STOCK ---
+# --- 6. UPLOAD BULK STOCK (WITH SEQUENTIAL IDS) ---
 @dp.callback_query(F.data == "adm_upload_stock")
 async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1775,7 +1806,10 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
                     except Exception:
                         pass
 
-    await message.answer(f"✅ Successfully added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
+        # Naye stock aate hi saare stock ko 1, 2, 3.. series me seal kar dena
+        await reindex_stock_table(conn)
+
+    await message.answer(f"✅ Successfully added <b>{added}</b> profiles. Stock sequence organized.", parse_mode="HTML")
     await state.clear()
 
 # --- 7. CHANGE RATES ---
@@ -1887,7 +1921,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH SECURE ONBOARDING CARD 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH AUTO STOCK RE-INDEXING 🔥")
 
     await dp.start_polling(bot)
 
