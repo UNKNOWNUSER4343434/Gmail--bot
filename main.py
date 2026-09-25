@@ -61,7 +61,6 @@ def get_user_mention(user_id: int, first_name: str, username: str = None) -> str
 
 # ======================= AUTO RE-INDEX STOCK FUNCTION =======================
 async def reindex_stock_table(conn):
-    # Bache hue saare stock ko temporary order karke 1, 2, 3... me re-arrange karna
     await conn.execute("""
         DO $$
         DECLARE
@@ -74,7 +73,6 @@ async def reindex_stock_table(conn):
             END LOOP;
         END $$;
     """)
-    # Sequence ko reset karna taki agla stock current count + 1 se start ho
     max_id = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM task_stock")
     if max_id == 0:
         await conn.execute("ALTER SEQUENCE task_stock_id_seq RESTART WITH 1")
@@ -193,7 +191,6 @@ async def init_db():
             INSERT INTO settings (key, value) VALUES ('ref_bonus', '1.0') ON CONFLICT (key) DO NOTHING;
         """)
 
-        # Startup time pe stock re-index check
         await reindex_stock_table(conn)
 
     print("Database connection ready with auto-reindexing!")
@@ -309,7 +306,7 @@ def kb_main_menu():
 def kb_sub_mode():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📁 Readymade Gmail"), KeyboardButton(text="⚡ Bot Task Account")],
+            [KeyboardButton(text="📁 Readymade Gmail"), KeyboardButton(text="⚡ Create New Account")],
             [KeyboardButton(text="❌ Cancel")]
         ],
         resize_keyboard=True
@@ -953,7 +950,7 @@ async def get_submissions_card(uid: int):
     else:
         for row in subs:
             st = str(row['status']).lower()
-            acc_type = "Task" if "Bot" in str(row['acc_type']) else "Ready"
+            acc_type = "Created" if "New" in str(row['acc_type']) or "Bot" in str(row['acc_type']) else "Ready"
             time_str = row['created_at'] or "Recent"
 
             card += f"<b>SUB #{row['id']} • {html.escape(row['email'])}</b> [{acc_type}]\n"
@@ -1012,7 +1009,7 @@ async def submit_start_mode(message: types.Message, state: FSMContext):
         f"1️⃣ <b>📁 Readymade Gmail:</b> <b>₹{r_ready:.2f}</b> per account\n"
         "• Submit pre-created active Gmail accounts.\n"
         "• Accounts must be clean, active, and accessible.\n\n"
-        f"2️⃣ <b>⚡ Bot Task Account:</b> <b>₹{r_bot:.2f}</b> per account\n"
+        f"2️⃣ <b>⚡ Create New Account:</b> <b>₹{r_bot:.2f}</b> per account\n"
         "• We provide specific Name, DOB, and Password.\n"
         "• <b>Time Window:</b> 30 Minutes to create and submit.\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1021,8 +1018,8 @@ async def submit_start_mode(message: types.Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=kb_sub_mode())
     await state.set_state(SubmitState.choosing_mode)
 
-# ----------------- FLOW 1: BOT TASK ACCOUNT -----------------
-@dp.message(SubmitState.choosing_mode, F.text == "⚡ Bot Task Account")
+# ----------------- FLOW 1: CREATE NEW ACCOUNT (WITH ADMIN OUT-OF-STOCK ALERT) -----------------
+@dp.message(SubmitState.choosing_mode, F.text == "⚡ Create New Account")
 async def submit_task_mode(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     r_bot = await get_setting("rate_botdata", 15.0)
@@ -1034,10 +1031,28 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
             FROM task_stock WHERE status='available' LIMIT 1
         """)
         if not row:
+            # 1. Notify user
             await message.answer(
-                "⚠️ <b>Task Stock Empty!</b>\nAll bot-data tasks are currently claimed. Please use 'Readymade Gmail' or wait for restock.",
+                "⚠️ <b>Inventory Exhausted!</b>\nAll registration slots are currently claimed. Please use 'Readymade Gmail' or wait for our next stock update.",
                 reply_markup=kb_main_menu()
             )
+            # 2. Real-time Admin Notification about stock shortage
+            user_link = get_user_mention(uid, message.from_user.first_name, message.from_user.username)
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "🚨 <b>STOCK SHORTAGE ALERT!</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 User: {user_link} (ID: <code>{uid}</code>)\n"
+                        "Attempted to request a task via <b>Create New Account</b>, but the stock inventory is currently <b>EMPTY (0 available)</b>!\n\n"
+                        "💡 <i>Upload fresh profiles via /upload to keep users earning.</i>"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Error alerting admin of stock shortage: {e}")
+
             await state.clear()
             return
 
@@ -1049,7 +1064,7 @@ async def submit_task_mode(message: types.Message, state: FSMContext):
         """, uid, now_ts, stock_id)
 
     await state.update_data(
-        acc_type="Bot-Data Task",
+        acc_type="Created Task Account",
         assigned_stock_id=stock_id,
         email=row['email'],
         password=row['password'],
@@ -1084,7 +1099,7 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
     data = await state.get_data()
     email = data.get("email")
     pwd = data.get("password")
-    acc_type = data.get("acc_type")
+    acc_type = data.get("acc_type", "Created Task Account")
     stock_id = data.get("assigned_stock_id")
     assigned_at = data.get("assigned_at", 0)
     now_ts = int(time.time())
@@ -1300,7 +1315,7 @@ async def admin_accept_sub(call: types.CallbackQuery):
         uid = int(row['user_id'])
         mail = row['email']
         acc_type = row['acc_type']
-        reward = await (get_setting("rate_botdata", 15.0) if "Bot" in str(acc_type) else get_setting("rate_readymade", 12.0))
+        reward = await (get_setting("rate_botdata", 15.0) if ("New" in str(acc_type) or "Bot" in str(acc_type)) else get_setting("rate_readymade", 12.0))
 
         await conn.execute("UPDATE submissions SET status='approved' WHERE id=$1", sub_id)
         await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id=$2", reward, uid)
@@ -1510,16 +1525,133 @@ async def admin_terminal(message: types.Message):
         "💰 <b>Current Rates:</b>\n"
         f"• Readymade Rate : ₹{r_ready:.2f}\n"
         f"• Bot Task Rate  : ₹{r_bot:.2f}\n"
-        f"• Refer Bonus    : ₹{r_ref:.2f}"
+        f"• Refer Bonus    : ₹{r_ref:.2f}\n\n"
+        "⚡ <b>Fast Command Shortcuts:</b>\n"
+        "<code>/pending</code> | <code>/payouts</code> | <code>/stock</code> | <code>/upload</code>\n"
+        "<code>/removestock</code> | <code>/ban</code> | <code>/rates</code> | <code>/adjustbalance</code>\n"
+        "<code>/broadcast &lt;message&gt;</code>"
     )
     await message.answer(card, parse_mode="HTML", reply_markup=kb)
 
-# --- 1. VIEW PENDING SUBMISSIONS ---
-@dp.callback_query(F.data == "adm_view_pending")
-async def adm_view_pending_subs(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
+# --- DIRECT SLASH COMMAND SHORTCUTS FOR ADMIN ---
+@dp.message(Command("pending"))
+async def cmd_pending_shortcut(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await show_pending_audits_list(message)
+
+@dp.message(Command("payouts"))
+async def cmd_payouts_shortcut(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await show_pending_payouts_list(message)
+
+@dp.message(Command("stock"))
+async def cmd_stock_shortcut(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await show_available_stock_list(message)
+
+@dp.message(Command("upload"))
+async def cmd_upload_shortcut(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = (
+        "📥 <b>Upload Task Stock (WhatsApp / Plain Format):</b>\n\n"
+        "<b>Accepted Format:</b>\n"
+        "<code>First name: John\n"
+        "Last name: Krum\n"
+        "---------\n"
+        "Date of birth\n"
+        "Month: July | Day: 12 | Year: 1986\n"
+        "---------\n"
+        "Email: johnkrumb623@gmail.com\n"
+        "---------\n"
+        "Password: 9VQZqgHRv6WU</code>\n\n"
+        "Paste your batch below:"
+    )
+    await message.answer(msg, parse_mode="HTML")
+    await state.set_state(AdminState.waiting_for_bulk_stock)
+
+@dp.message(Command("removestock"))
+async def cmd_removestock_shortcut(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = (
+        "🗑 <b>Remove Stock Mail (Batch / Multi Supported):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ <b>Range Format:</b> <code>4-10</code>\n"
+        "2️⃣ <b>Comma Format:</b> <code>5, 8, 12, 15</code>\n"
+        "3️⃣ <b>Single Item:</b> <code>7</code> ya <code>test@gmail.com</code>\n"
+        "4️⃣ <b>Clear All:</b> <code>ALL</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Apna command ya ID list yahan bhejein:"
+    )
+    await message.answer(msg, parse_mode="HTML")
+    await state.set_state(AdminState.waiting_for_del_stock)
+
+@dp.message(Command("ban"))
+async def cmd_ban_shortcut(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Enter the Telegram User ID to Ban or Unban:")
+    await state.set_state(AdminState.waiting_for_ban_uid)
+
+@dp.message(Command("rates"))
+async def cmd_rates_shortcut(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    r_ready = await get_setting("rate_readymade", 12.0)
+    r_bot = await get_setting("rate_botdata", 15.0)
+    r_ref = await get_setting("ref_bonus", 1.0)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"⚙️ Readymade (₹{r_ready:.2f})", callback_data="rate_change_readymade"),
+            InlineKeyboardButton(text=f"⚙️ Bot Task (₹{r_bot:.2f})", callback_data="rate_change_botdata")
+        ],
+        [InlineKeyboardButton(text=f"🎁 Refer Bonus (₹{r_ref:.2f})", callback_data="rate_change_ref")]
+    ])
+    await message.answer("⚙️ <b>Select rate to modify:</b>", parse_mode="HTML", reply_markup=kb)
+
+@dp.message(Command("adjustbalance"))
+async def cmd_adjustbalance_shortcut(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Enter target Telegram User ID:")
+    await state.set_state(AdminState.waiting_for_addbal_id)
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast_shortcut(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text_content = message.text.replace("/broadcast", "", 1).strip()
+    if not text_content:
+        await message.answer("⚠️ <b>Usage:</b> <code>/broadcast Your message goes here</code>", parse_mode="HTML")
         return
 
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users WHERE is_banned=FALSE")
+
+    sent = 0
+    broadcast_body = (
+        "📢 <b>OFFICIAL ANNOUNCEMENT</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{html.escape(text_content)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>- GmailArena Executive Team</i>"
+    )
+    for u in users:
+        try:
+            await bot.send_message(chat_id=u['user_id'], text=broadcast_body, parse_mode="HTML")
+            sent += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+
+    await message.answer(f"✅ Broadcast sent successfully to <b>{sent}</b> users.", parse_mode="HTML")
+
+# --- REUSABLE ADMIN LIST METHODS ---
+async def show_pending_audits_list(target_chat):
     async with db_pool.acquire() as conn:
         subs = await conn.fetch("""
             SELECT s.id, s.user_id, s.acc_type, s.email, s.password, s.recovery, s.two_fa, s.created_at, u.username
@@ -1529,11 +1661,11 @@ async def adm_view_pending_subs(call: types.CallbackQuery):
         """)
 
     if not subs:
-        await call.answer("No pending submissions found!", show_alert=True)
+        await target_chat.answer("No pending submissions found!")
         return
 
     for s in subs:
-        r_est = await (get_setting("rate_botdata", 15.0) if "Bot" in str(s['acc_type']) else get_setting("rate_readymade", 12.0))
+        r_est = await (get_setting("rate_botdata", 15.0) if ("New" in str(s['acc_type']) or "Bot" in str(s['acc_type'])) else get_setting("rate_readymade", 12.0))
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{s['id']}"),
             InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{s['id']}")
@@ -1551,31 +1683,86 @@ async def adm_view_pending_subs(call: types.CallbackQuery):
             f"🔐 2FA     : <code>{html.escape(s['two_fa'] or 'None')}</code>\n"
             f"📅 Date    : {s['created_at']}"
         )
-        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    await call.answer()
+        if hasattr(target_chat, "message"):
+            await target_chat.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await target_chat.answer(text, parse_mode="HTML", reply_markup=kb)
 
-# --- 2. VIEW AVAILABLE STOCK ---
-@dp.callback_query(F.data == "adm_view_stock")
-async def adm_view_stock_list(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-
+async def show_available_stock_list(target_chat):
     async with db_pool.acquire() as conn:
         stock = await conn.fetch("SELECT id, first_name, last_name, email, password FROM task_stock WHERE status='available' ORDER BY id ASC LIMIT 15")
 
     if not stock:
-        await call.answer("Available stock is completely empty!", show_alert=True)
+        await target_chat.answer("Available stock is completely empty!")
         return
 
     text = "📦 <b>Available Bot Task Stock (First 15):</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for item in stock:
         text += f"• <b>[ID: {item['id']}]</b> <code>{item['email']}</code> | Pass: <code>{item['password']}</code> ({item['first_name']} {item['last_name']})\n"
-    text += "\n<i>To remove, use '🗑 Remove Stock Mail' (supports range like 4-10).</i>"
+    text += "\n<i>To remove, use /removestock or range like 4-10.</i>"
 
-    await call.message.answer(text, parse_mode="HTML")
+    if hasattr(target_chat, "message"):
+        await target_chat.message.answer(text, parse_mode="HTML")
+    else:
+        await target_chat.answer(text, parse_mode="HTML")
+
+async def show_pending_payouts_list(target_chat):
+    async with db_pool.acquire() as conn:
+        payouts = await conn.fetch("""
+            SELECT w.id, w.order_id, w.user_id, w.amount, w.method, w.payout_address, w.upi_id, w.created_at, u.username 
+            FROM withdrawals w
+            LEFT JOIN users u ON w.user_id = u.user_id
+            WHERE LOWER(w.status)='pending' ORDER BY w.id ASC LIMIT 5
+        """)
+
+    if not payouts:
+        await target_chat.answer("No pending withdrawals found!")
+        return
+
+    for p in payouts:
+        method = p['method'] or 'UPI'
+        addr = p['payout_address'] or p['upi_id']
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💸 Mark Paid & Assign Ref/TxID", callback_data=f"startpay_{p['id']}")
+        ]])
+        
+        user_link = get_user_mention(p['user_id'], p['username'] or "User", p['username'])
+        text = (
+            f"💸 <b>Pending Cashout [{p['order_id']}]</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 User    : {user_link} (ID: <code>{p['user_id']}</code>)\n"
+            f"💵 Amount  : <b>₹{float(p['amount']):.2f}</b>\n"
+            f"🏷 Method  : <b>{method}</b>\n"
+            f"🎯 Target  : <code>{html.escape(addr)}</code>\n"
+            f"📅 Date    : {p['created_at']}"
+        )
+        if hasattr(target_chat, "message"):
+            await target_chat.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await target_chat.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# --- INLINE CALLBACK HANDLERS FOR ADMIN MENU ---
+@dp.callback_query(F.data == "adm_view_pending")
+async def adm_view_pending_subs_call(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await show_pending_audits_list(call)
     await call.answer()
 
-# --- 3. ADVANCED MULTI & RANGE REMOVE MAIL FROM STOCK (WITH AUTO RE-INDEX) ---
+@dp.callback_query(F.data == "adm_view_stock")
+async def adm_view_stock_list_call(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await show_available_stock_list(call)
+    await call.answer()
+
+@dp.callback_query(F.data == "adm_view_payouts")
+async def adm_view_payouts_list_call(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await show_pending_payouts_list(call)
+    await call.answer()
+
 @dp.callback_query(F.data == "adm_del_stock")
 async def adm_del_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1583,13 +1770,11 @@ async def adm_del_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     msg = (
         "🗑 <b>Remove Stock Mail (Batch / Multi Supported):</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Aap niche diye gaye tareeqon se delete kar sakte hain:\n\n"
-        "1️⃣ <b>Range Format:</b> <code>4-10</code> (ID 4 se 10 tak sab delete)\n"
-        "2️⃣ <b>Comma Format:</b> <code>5, 8, 12, 15</code> (Multiple IDs)\n"
+        "1️⃣ <b>Range Format:</b> <code>4-10</code>\n"
+        "2️⃣ <b>Comma Format:</b> <code>5, 8, 12, 15</code>\n"
         "3️⃣ <b>Single Item:</b> <code>7</code> ya <code>test@gmail.com</code>\n"
-        "4️⃣ <b>Clear All:</b> <code>ALL</code> (Poora stock clear karne ke liye)\n"
+        "4️⃣ <b>Clear All:</b> <code>ALL</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Note: Delete hone ke baad stock IDs automatically 1 se reorganize ho jayengi.</i>\n\n"
         "Apna command ya ID list yahan bhejein:"
     )
     await call.message.answer(msg, parse_mode="HTML")
@@ -1659,45 +1844,6 @@ async def adm_del_stock_process(message: types.Message, state: FSMContext):
 
     await state.clear()
 
-# --- 4. VIEW PENDING PAYOUTS ---
-@dp.callback_query(F.data == "adm_view_payouts")
-async def adm_view_payouts_list(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-
-    async with db_pool.acquire() as conn:
-        payouts = await conn.fetch("""
-            SELECT w.id, w.order_id, w.user_id, w.amount, w.method, w.payout_address, w.upi_id, w.created_at, u.username 
-            FROM withdrawals w
-            LEFT JOIN users u ON w.user_id = u.user_id
-            WHERE LOWER(w.status)='pending' ORDER BY w.id ASC LIMIT 5
-        """)
-
-    if not payouts:
-        await call.answer("No pending withdrawals found!", show_alert=True)
-        return
-
-    for p in payouts:
-        method = p['method'] or 'UPI'
-        addr = p['payout_address'] or p['upi_id']
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="💸 Mark Paid & Assign Ref/TxID", callback_data=f"startpay_{p['id']}")
-        ]])
-        
-        user_link = get_user_mention(p['user_id'], p['username'] or "User", p['username'])
-        text = (
-            f"💸 <b>Pending Cashout [{p['order_id']}]</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 User    : {user_link} (ID: <code>{p['user_id']}</code>)\n"
-            f"💵 Amount  : <b>₹{float(p['amount']):.2f}</b>\n"
-            f"🏷 Method  : <b>{method}</b>\n"
-            f"🎯 Target  : <code>{html.escape(addr)}</code>\n"
-            f"📅 Date    : {p['created_at']}"
-        )
-        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    await call.answer()
-
-# --- 5. BAN / UNBAN USER ---
 @dp.callback_query(F.data == "adm_toggle_ban")
 async def adm_toggle_ban_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1727,7 +1873,6 @@ async def adm_toggle_ban_process(message: types.Message, state: FSMContext):
     await message.answer(f"User <code>{uid}</code> status is now: {status_str}", parse_mode="HTML")
     await state.clear()
 
-# --- 6. UPLOAD BULK STOCK (WITH SEQUENTIAL IDS) ---
 @dp.callback_query(F.data == "adm_upload_stock")
 async def adm_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1806,13 +1951,11 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
                     except Exception:
                         pass
 
-        # Naye stock aate hi saare stock ko 1, 2, 3.. series me seal kar dena
         await reindex_stock_table(conn)
 
     await message.answer(f"✅ Successfully added <b>{added}</b> profiles. Stock sequence organized.", parse_mode="HTML")
     await state.clear()
 
-# --- 7. CHANGE RATES ---
 @dp.callback_query(F.data.startswith("rate_change_"))
 async def adm_rate_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1822,7 +1965,7 @@ async def adm_rate_prompt(call: types.CallbackQuery, state: FSMContext):
 
     labels = {
         "readymade": "Readymade Accounts",
-        "botdata": "Bot Task Accounts",
+        "botdata": "Create New Accounts",
         "ref": "Referral Bonus"
     }
     await call.message.answer(f"⚙️ Enter new price rate for <b>{labels.get(r_type, r_type)}</b>:", parse_mode="HTML")
@@ -1847,7 +1990,7 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
         
         labels = {
             "readymade": "Readymade Accounts",
-            "botdata": "Bot Task Accounts",
+            "botdata": "Create New Accounts",
             "ref": "Referral Bonus"
         }
         label_text = labels.get(r_type, "Accounts")
@@ -1867,7 +2010,6 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Please provide a valid numerical amount.")
     await state.clear()
 
-# --- 8. ADJUST USER BALANCE ---
 @dp.callback_query(F.data == "adm_add_bal")
 async def adm_bal_id_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1921,7 +2063,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH AUTO STOCK RE-INDEXING 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH ADMIN SHORTCUTS & STOCK SHORTAGE ALERTS 🔥")
 
     await dp.start_polling(bot)
 
