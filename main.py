@@ -22,8 +22,13 @@ from aiogram.types import (
 # ======================= CONFIGURATION =======================
 BOT_TOKEN = "8822939259:AAGxqsUpMXIs1U01PAKkLJcCWqzHblf6Uog"
 ADMIN_ID = 5834588787
+
+# Channels for Force Subscription Lock
+CHANNEL_UPDATES_USERNAME = "@Gmail_arena"
+CHANNEL_PAYOUTS_USERNAME = "@gmail_payouts"
 CHANNEL_LINK = "https://t.me/Gmail_arena"
 PAYOUT_PROOF_CHANNEL = "@gmail_payouts"
+
 SUPPORT_USER = "@sxhivv"
 RAW_DB_URL = os.environ.get("DATABASE_URL", "")
 TASK_TIMEOUT_SECONDS = 1800  # 30 Minutes
@@ -47,6 +52,50 @@ db_pool = None
 
 UPI_REGEX = re.compile(r'^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$')
 BEP20_REGEX = re.compile(r'^0x[a-fA-F0-9]{40}$')
+
+def get_user_mention(user_id: int, first_name: str, username: str = None) -> str:
+    safe_name = html.escape(first_name or "User")
+    if username:
+        return f'<a href="tg://user?id={user_id}">{safe_name}</a> (@{username})'
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+
+# ======================= CHANNEL MEMBERSHIP CHECK =======================
+async def check_user_channels(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    channels = [CHANNEL_UPDATES_USERNAME, CHANNEL_PAYOUTS_USERNAME]
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception as e:
+            print(f"Error checking membership in {ch} for {user_id}: {e}")
+            continue
+    return True
+
+def get_force_join_card():
+    text = (
+        "👑 <b>Welcome to GmailArena Network!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "The most trusted platform to monetize fresh & readymade Google accounts with 100% automated payouts.\n\n"
+        "⚡ <b>Platform Highlights:</b>\n"
+        "• 🔒 <b>100% Safe & Secure:</b> Cloud-encrypted verification protocol\n"
+        "• 💸 <b>Dual Payouts:</b> Instant settlements via UPI & Crypto (Binance/USDT)\n"
+        "• ⏱ <b>Fast Processing:</b> Quick 24–48 hours verification turnaround\n"
+        "• 👥 <b>Affiliate Rewards:</b> Earn permanent passive commission per referral\n\n"
+        "📢 <b>Mandatory Verification Step:</b>\n"
+        "To unlock the dashboard and prevent duplicate entries, please join our official channels below:\n\n"
+        "1️⃣ Tap <b>Join Updates Channel</b>\n"
+        "2️⃣ Tap <b>Join Payouts Channel</b>\n"
+        "3️⃣ Tap <b>✅ Verify & Unlock Bot</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Join Updates Channel", url=f"https://t.me/{CHANNEL_UPDATES_USERNAME.replace('@', '')}")],
+        [InlineKeyboardButton(text="💸 Join Payouts Channel", url=f"https://t.me/{CHANNEL_PAYOUTS_USERNAME.replace('@', '')}")],
+        [InlineKeyboardButton(text="✅ Verify & Unlock Bot", callback_data="verify_channels_sub")]
+    ])
+    return text, kb
 
 # ======================= DATABASE SETUP =======================
 async def init_db():
@@ -338,14 +387,58 @@ class AdminState(StatesGroup):
     waiting_for_ban_uid = State()
     waiting_for_del_stock = State()
 
-# ======================= BAN CHECK MIDDLEWARE =======================
+# ======================= BAN & MEMBERSHIP MIDDLEWARE =======================
 @dp.message.outer_middleware()
-async def ban_filter_middleware(handler, event: types.Message, data):
-    if event.from_user and await is_user_banned(event.from_user.id):
-        if event.from_user.id != ADMIN_ID:
-            await event.answer("🚫 <b>Your account has been permanently suspended for policy violations.</b>", parse_mode="HTML")
+async def access_filter_middleware(handler, event: types.Message, data):
+    if not event.from_user:
+        return await handler(event, data)
+
+    uid = event.from_user.id
+    if await is_user_banned(uid) and uid != ADMIN_ID:
+        await event.answer("🚫 <b>Your account has been permanently suspended for policy violations.</b>", parse_mode="HTML")
+        return
+
+    # Check force channel subscription for normal messages (except /start)
+    if event.text and not event.text.startswith("/start") and uid != ADMIN_ID:
+        is_joined = await check_user_channels(uid)
+        if not is_joined:
+            text, kb = get_force_join_card()
+            await event.answer(text, parse_mode="HTML", reply_markup=kb)
             return
+
     return await handler(event, data)
+
+# ======================= FORCE SUBSCRIBE VERIFY CALLBACK =======================
+@dp.callback_query(F.data == "verify_channels_sub")
+async def verify_channels_callback(call: types.CallbackQuery):
+    uid = call.from_user.id
+    is_joined = await check_user_channels(uid)
+
+    if not is_joined:
+        await call.answer("❌ You have not joined both channels yet! Please join to unlock.", show_alert=True)
+        return
+
+    await call.answer("✅ Verification successful! Welcome to GmailArena.", show_alert=False)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    r_bot = await get_setting("rate_botdata", 15.0)
+    r_ready = await get_setting("rate_readymade", 12.0)
+
+    welcome_msg = (
+        f"🎉 <b>Access Granted, {html.escape(call.from_user.first_name)}!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Start generating income by creating or supplying verified Google accounts.\n\n"
+        "💰 <b>Current Rates:</b>\n"
+        f"• ⚡ <b>Bot Task Creation:</b> ₹{r_bot:.2f} per account\n"
+        f"• 📁 <b>Readymade Gmail :</b> ₹{r_ready:.2f} per account\n\n"
+        "⏱ <b>Audit Window:</b> 24 to 48 Hours\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select an option below to start:"
+    )
+    await call.message.answer(welcome_msg, parse_mode="HTML", reply_markup=kb_main_menu())
 
 # ======================= CANCEL ACTION =======================
 @dp.message(F.text == "❌ Cancel")
@@ -371,11 +464,18 @@ async def start_handler(message: types.Message, state: FSMContext):
     uname = message.from_user.username or message.from_user.first_name
     await ensure_user(uid, uname, ref_id)
 
+    # Force Channel Join Check on /start
+    is_joined = await check_user_channels(uid)
+    if not is_joined:
+        text, kb = get_force_join_card()
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return
+
     r_bot = await get_setting("rate_botdata", 15.0)
     r_ready = await get_setting("rate_readymade", 12.0)
 
     msg = (
-        f"👋 <b>Welcome, {html.escape(message.from_user.first_name)}!</b>\n"
+        f"👋 <b>Welcome back, {html.escape(message.from_user.first_name)}!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Earn instant money by providing verified Google accounts.\n\n"
         "💰 <b>Current Rates:</b>\n"
@@ -400,7 +500,10 @@ async def support_handler(message: types.Message):
 @dp.message(F.text == "📢 Official Channel")
 async def channel_handler(message: types.Message):
     await message.answer(
-        f"📢 <b>Official Telegram Channel:</b>\n{CHANNEL_LINK}\n\nFollow for real-time payment proofs and notices.",
+        f"📢 <b>Official Telegram Channels:</b>\n"
+        f"• Updates & Notices: {CHANNEL_LINK}\n"
+        f"• Payment Proofs: https://t.me/{CHANNEL_PAYOUTS_USERNAME.replace('@', '')}\n\n"
+        "Follow both channels for news and daily disbursement proofs.",
         parse_mode="HTML"
     )
 
@@ -659,12 +762,14 @@ async def finalize_cashout_order(message: types.Message, state: FSMContext, meth
         InlineKeyboardButton(text="💸 Mark Paid & Assign TxID / Ref", callback_data=f"startpay_{w_id}")
     ]])
 
+    user_link = get_user_mention(uid, message.from_user.first_name, message.from_user.username)
+
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
             f"🔔 <b>New Withdrawal Request: {order_id}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 User: @{message.from_user.username} (ID: <code>{uid}</code>)\n"
+            f"👤 User: {user_link} (ID: <code>{uid}</code>)\n"
             f"💵 Amount: <b>₹{balance:.2f}</b>\n"
             f"🏷 Method: <b>{method}</b>\n"
             f"🎯 Target Address: <code>{html.escape(payout_target)}</code>\n"
@@ -724,7 +829,7 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT w.order_id, w.user_id, w.amount, w.method, w.payout_address, w.upi_id, u.username 
+            SELECT w.order_id, w.user_id, w.amount, w.method, w.payout_address, w.upi_id, u.username, u.username as first_name
             FROM withdrawals w 
             LEFT JOIN users u ON w.user_id = u.user_id 
             WHERE w.id=$1
@@ -760,7 +865,7 @@ async def admin_save_utr(message: types.Message, state: FSMContext):
             except Exception as e:
                 print(f"Error notifying user: {e}")
 
-            # 2. Mask destination for public security
+            # 2. Mask destination for privacy
             if "@" in target_addr:
                 parts = target_addr.split("@")
                 masked_target = parts[0][:2] + "****" + parts[0][-1:] + "@" + parts[1] if len(parts[0]) > 2 else "****@" + parts[1]
@@ -986,13 +1091,15 @@ async def bot_task_done_clicked(message: types.Message, state: FSMContext):
         InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{sub_id}")
     ]])
 
+    user_link = get_user_mention(user.id, user.first_name, user.username)
+
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
             f"📥 <b>New Submission Alert [SUB #{sub_id}]</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 Submission ID: <b>SUB #{sub_id}</b>\n"
-            f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
+            f"👤 User: {user_link} (ID: <code>{user.id}</code>)\n"
             f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n\n"
             f"📧 Email    : <code>{html.escape(email)}</code>\n"
             f"🔑 Password : <code>{html.escape(pwd)}</code>\n"
@@ -1122,13 +1229,15 @@ async def finalize_readymade_submission(message: types.Message, state: FSMContex
         InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{sub_id}")
     ]])
 
+    user_link = get_user_mention(user.id, user.first_name, user.username)
+
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
             f"📥 <b>New Submission Alert [SUB #{sub_id}]</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 Submission ID: <b>SUB #{sub_id}</b>\n"
-            f"👤 User: @{user.username} (ID: <code>{user.id}</code>)\n"
+            f"👤 User: {user_link} (ID: <code>{user.id}</code>)\n"
             f"🏷 Type: <b>{acc_type}</b> (Reward: ₹{r_est:.2f})\n"
             f"📅 Vintage (>30 Days): <b>{is_old}</b>\n\n"
             f"📧 Email    : <code>{html.escape(email)}</code>\n"
@@ -1255,7 +1364,6 @@ async def admin_reject_quick(call: types.CallbackQuery):
 
         await conn.execute("UPDATE submissions SET status='rejected', rejection_reason=$1 WHERE id=$2", reason, sub_id)
 
-        # Return to stock if bot task was rejected
         if stock_ref:
             await conn.execute("UPDATE task_stock SET status='available', assigned_to=NULL, assigned_at=0 WHERE id=$1", stock_ref)
 
@@ -1388,8 +1496,10 @@ async def adm_view_pending_subs(call: types.CallbackQuery):
 
     async with db_pool.acquire() as conn:
         subs = await conn.fetch("""
-            SELECT id, user_id, acc_type, email, password, recovery, two_fa, created_at 
-            FROM submissions WHERE LOWER(status)='pending' ORDER BY id ASC LIMIT 5
+            SELECT s.id, s.user_id, s.acc_type, s.email, s.password, s.recovery, s.two_fa, s.created_at, u.username
+            FROM submissions s
+            LEFT JOIN users u ON s.user_id = u.user_id
+            WHERE LOWER(s.status)='pending' ORDER BY s.id ASC LIMIT 5
         """)
 
     if not subs:
@@ -1402,10 +1512,12 @@ async def adm_view_pending_subs(call: types.CallbackQuery):
             InlineKeyboardButton(text=f"✅ Approve (+₹{r_est:.2f})", callback_data=f"adm_app_{s['id']}"),
             InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_rejmenu_{s['id']}")
         ]])
+        
+        user_link = get_user_mention(s['user_id'], s['username'] or "User", s['username'])
         text = (
             f"⏳ <b>Pending Submission [SUB #{s['id']}]</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 User ID : <code>{s['user_id']}</code>\n"
+            f"👤 User    : {user_link} (ID: <code>{s['user_id']}</code>)\n"
             f"🏷 Type    : <b>{s['acc_type']}</b>\n"
             f"📧 Email   : <code>{html.escape(s['email'])}</code>\n"
             f"🔑 Pass    : <code>{html.escape(s['password'])}</code>\n"
@@ -1432,17 +1544,28 @@ async def adm_view_stock_list(call: types.CallbackQuery):
     text = "📦 <b>Available Bot Task Stock (First 15):</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for item in stock:
         text += f"• <b>[ID: {item['id']}]</b> <code>{item['email']}</code> | Pass: <code>{item['password']}</code> ({item['first_name']} {item['last_name']})\n"
-    text += "\n<i>To remove any profile, use the '🗑 Remove Stock Mail' button.</i>"
+    text += "\n<i>To remove, use '🗑 Remove Stock Mail' (supports range like 4-10).</i>"
 
     await call.message.answer(text, parse_mode="HTML")
     await call.answer()
 
-# --- 3. REMOVE MAIL FROM STOCK ---
+# --- 3. ADVANCED MULTI & RANGE REMOVE MAIL FROM STOCK ---
 @dp.callback_query(F.data == "adm_del_stock")
 async def adm_del_stock_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
-    await call.message.answer("🗑 <b>Enter the Stock Task ID or Email Address to delete:</b>", parse_mode="HTML")
+    msg = (
+        "🗑 <b>Remove Stock Mail (Batch / Multi Supported):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Aap niche diye gaye tareeqon se delete kar sakte hain:\n\n"
+        "1️⃣ <b>Range Format:</b> <code>4-10</code> (ID 4 se 10 tak sab delete)\n"
+        "2️⃣ <b>Comma Format:</b> <code>5, 8, 12, 15</code> (Multiple IDs)\n"
+        "3️⃣ <b>Single Item:</b> <code>7</code> ya <code>test@gmail.com</code>\n"
+        "4️⃣ <b>Clear All:</b> <code>ALL</code> (Poora stock clear karne ke liye)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Apna command ya ID list yahan bhejein:"
+    )
+    await call.message.answer(msg, parse_mode="HTML")
     await state.set_state(AdminState.waiting_for_del_stock)
     await call.answer()
 
@@ -1451,17 +1574,58 @@ async def adm_del_stock_process(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     target = message.text.strip()
+    deleted_count = 0
 
     async with db_pool.acquire() as conn:
+        if target.upper() == "ALL":
+            res = await conn.execute("DELETE FROM task_stock WHERE status='available'")
+            try:
+                deleted_count = int(res.split()[1])
+            except:
+                deleted_count = 0
+            await message.answer(f"✅ Cleared entire available stock. (Total <b>{deleted_count}</b> profiles deleted).", parse_mode="HTML")
+            await state.clear()
+            return
+
+        range_match = re.match(r'^(\d+)\s*-\s*(\d+)$', target)
+        if range_match:
+            start_id = int(range_match.group(1))
+            end_id = int(range_match.group(2))
+            if start_id > end_id:
+                start_id, end_id = end_id, start_id
+
+            res = await conn.execute("DELETE FROM task_stock WHERE id >= $1 AND id <= $2", start_id, end_id)
+            try:
+                deleted_count = int(res.split()[1])
+            except:
+                deleted_count = 0
+            await message.answer(f"✅ Range Delete Successful! Removed <b>{deleted_count}</b> profiles (IDs {start_id} to {end_id}).", parse_mode="HTML")
+            await state.clear()
+            return
+
+        if "," in target:
+            raw_ids = [s.strip() for s in target.split(",") if s.strip().isdigit()]
+            if raw_ids:
+                int_ids = [int(i) for i in raw_ids]
+                res = await conn.execute("DELETE FROM task_stock WHERE id = ANY($1::int[])", int_ids)
+                try:
+                    deleted_count = int(res.split()[1])
+                except:
+                    deleted_count = 0
+                await message.answer(f"✅ Batch Delete Successful! Removed <b>{deleted_count}</b> profiles.", parse_mode="HTML")
+                await state.clear()
+                return
+
         if target.isdigit():
             res = await conn.execute("DELETE FROM task_stock WHERE id=$1", int(target))
         else:
             res = await conn.execute("DELETE FROM task_stock WHERE email=$1", target)
 
-    if "DELETE 0" in res:
-        await message.answer(f"⚠️ No stock profile found matching: <code>{html.escape(target)}</code>", parse_mode="HTML")
-    else:
-        await message.answer(f"✅ Successfully removed profile <code>{html.escape(target)}</code> from stock.", parse_mode="HTML")
+        if "DELETE 0" in res:
+            await message.answer(f"⚠️ No stock profile found matching: <code>{html.escape(target)}</code>", parse_mode="HTML")
+        else:
+            await message.answer(f"✅ Successfully deleted profile: <code>{html.escape(target)}</code>", parse_mode="HTML")
+
     await state.clear()
 
 # --- 4. VIEW PENDING PAYOUTS ---
@@ -1472,8 +1636,10 @@ async def adm_view_payouts_list(call: types.CallbackQuery):
 
     async with db_pool.acquire() as conn:
         payouts = await conn.fetch("""
-            SELECT id, order_id, user_id, amount, method, payout_address, upi_id, created_at 
-            FROM withdrawals WHERE LOWER(status)='pending' ORDER BY id ASC LIMIT 5
+            SELECT w.id, w.order_id, w.user_id, w.amount, w.method, w.payout_address, w.upi_id, w.created_at, u.username 
+            FROM withdrawals w
+            LEFT JOIN users u ON w.user_id = u.user_id
+            WHERE LOWER(w.status)='pending' ORDER BY w.id ASC LIMIT 5
         """)
 
     if not payouts:
@@ -1486,10 +1652,12 @@ async def adm_view_payouts_list(call: types.CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="💸 Mark Paid & Assign Ref/TxID", callback_data=f"startpay_{p['id']}")
         ]])
+        
+        user_link = get_user_mention(p['user_id'], p['username'] or "User", p['username'])
         text = (
             f"💸 <b>Pending Cashout [{p['order_id']}]</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 User ID : <code>{p['user_id']}</code>\n"
+            f"👤 User    : {user_link} (ID: <code>{p['user_id']}</code>)\n"
             f"💵 Amount  : <b>₹{float(p['amount']):.2f}</b>\n"
             f"🏷 Method  : <b>{method}</b>\n"
             f"🎯 Target  : <code>{html.escape(addr)}</code>\n"
@@ -1610,6 +1778,7 @@ async def adm_stock_process(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Successfully added <b>{added}</b> profiles to active stock.", parse_mode="HTML")
     await state.clear()
 
+# --- 7. CHANGE RATES ---
 @dp.callback_query(F.data.startswith("rate_change_"))
 async def adm_rate_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1664,6 +1833,7 @@ async def adm_rate_save(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Please provide a valid numerical amount.")
     await state.clear()
 
+# --- 8. ADJUST USER BALANCE ---
 @dp.callback_query(F.data == "adm_add_bal")
 async def adm_bal_id_prompt(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
@@ -1717,7 +1887,7 @@ async def main():
     print(f"🔥 Web Server bound to port {port}")
     print("🔥 PURGING TELEGRAM UPDATES QUEUE...")
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🔥 GMAILARENA BOT LIVE WITH AUTO PROOF CHANNEL BROADCAST 🔥")
+    print("🔥 GMAILARENA BOT LIVE WITH SECURE ONBOARDING CARD 🔥")
 
     await dp.start_polling(bot)
 
